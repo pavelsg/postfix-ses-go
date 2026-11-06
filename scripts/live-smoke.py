@@ -33,6 +33,29 @@ TEMPFAIL_DIAGNOSTICS = {
     b"4.3.0 postfix-ses-go: SES submission failed",
 }
 
+# Accept only the transport's fixed code vocabulary. SES messages and arbitrary
+# exception strings can contain addresses or credential material.
+SMOKE_AWS_CODES = {
+    b"AccessDenied", b"AccessDeniedException", b"AccountSuspendedException", b"BadRequestException",
+    b"ExpiredToken", b"ExpiredTokenException", b"IncompleteSignature", b"InvalidClientTokenId",
+    b"InvalidParameterValue", b"InvalidSignatureException", b"LimitExceededException",
+    b"MailFromDomainNotVerifiedException", b"MessageRejected", b"NotFoundException", b"RequestExpired",
+    b"RequestTimeout", b"SendingPausedException", b"SignatureDoesNotMatch", b"Throttling",
+    b"ThrottlingException", b"TooManyRequestsException", b"Unknown", b"UnrecognizedClientException",
+}
+SES_DETAIL = re.compile(
+    rb"postfix-ses-go-smoke: stage=ses http_status=[1-5][0-9]{2} aws_code=([A-Za-z0-9]+) "
+    rb"request_id=(?:unknown|[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})"
+)
+
+
+def safe_smoke_detail(line: bytes) -> bool:
+    """Recognize a complete operator diagnostic before displaying any child output."""
+    if line in (b"postfix-ses-go-smoke: stage=setup", b"postfix-ses-go-smoke: stage=transport"):
+        return True
+    match = SES_DETAIL.fullmatch(line)
+    return match is not None and match[1] in SMOKE_AWS_CODES
+
 
 def mailbox(value: str) -> str:
     """Require one plain ASCII addr-spec suitable for a synthetic pipe invocation."""
@@ -65,16 +88,16 @@ def send(binary: Path, region: str, sender: str, recipient: str) -> dict:
     message.set_content(f"Postfix SES smoke message {marker}.")
     print(f"Sending one smoke message with marker {marker}", file=sys.stderr, flush=True)
     result = subprocess.run([str(binary.resolve()), sender, recipient, marker],
-                            env={**os.environ, "AWS_REGION": region},
+                            env={**os.environ, "AWS_REGION": region, "POSTFIX_SES_SMOKE_DIAGNOSTICS": "1"},
                             input=message.as_bytes(), capture_output=True, timeout=30)
     if result.returncode:
-        diagnostic = result.stderr.removesuffix(b"\n")
         if result.returncode == 75:
-            if diagnostic in TEMPFAIL_DIAGNOSTICS:
-                raise ValueError(f"delivery agent exited 75: {diagnostic.decode('ascii')}")
-            if diagnostic == f"4.3.0 postfix-ses-go: SES acceptance uncertain queue_id={marker}".encode():
-                raise ValueError(f"delivery agent exited 75: {diagnostic.decode('ascii')}. "
-                                 "Inspect mailbox and events before resending")
+            diagnostic = result.stderr.removesuffix(b"\n")
+            reason, newline, detail = diagnostic.partition(b"\n")
+            uncertain = reason == f"4.3.0 postfix-ses-go: SES acceptance uncertain queue_id={marker}".encode()
+            if (reason in TEMPFAIL_DIAGNOSTICS or uncertain) and (not newline or safe_smoke_detail(detail)):
+                advice = "\nInspect mailbox and events before resending" if uncertain else ""
+                raise ValueError(f"delivery agent exited 75: {diagnostic.decode('ascii')}{advice}")
         if result.returncode < 0 or b"acceptance uncertain" in result.stderr:
             raise ValueError("SES acceptance uncertain. Inspect mailbox and events before resending")
         raise ValueError(f"delivery agent exited {result.returncode}. No acceptance confirmed")

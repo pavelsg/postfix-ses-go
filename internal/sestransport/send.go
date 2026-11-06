@@ -16,11 +16,13 @@ import (
 	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/smithy-go/logging"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // These errors are safe to map to diagnostics visible to Postfix and senders.
@@ -45,24 +47,24 @@ var (
 func Send(ctx context.Context, sender, recipient string, raw []byte) (string, error) {
 	from, err := mailbox(sender)
 	if err != nil {
-		return "", err
+		return "", &sendFailure{err, "stage=setup"}
 	}
 	to, err := mailbox(recipient)
 	if err != nil {
-		return "", err
+		return "", &sendFailure{err, "stage=setup"}
 	}
 	if len(raw) == 0 {
-		return "", ErrTemporary
+		return "", &sendFailure{ErrTemporary, "stage=setup"}
 	}
 	if _, ok := ctx.Deadline(); !ok {
-		return "", ErrConfiguration
+		return "", &sendFailure{ErrConfiguration, "stage=setup"}
 	}
 	client, err := newClient(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", ErrTemporary
+			return "", &sendFailure{ErrTemporary, "stage=setup"}
 		}
-		return "", err
+		return "", &sendFailure{err, "stage=setup"}
 	}
 	// A transport failure before any request headers were written cannot have
 	// submitted the message. After that point use the conservative outcome.
@@ -74,11 +76,13 @@ func Send(ctx context.Context, sender, recipient string, raw []byte) (string, er
 		Content:          &types.EmailContent{Raw: &types.RawMessage{Data: raw}},
 	})
 	if err != nil {
-		return "", classifySendError(err, wroteHeaders.Load(), raw)
+		return "", responseFailure(classifySendError(err, wroteHeaders.Load(), raw), err)
 	}
 	id := aws.ToString(out.MessageId)
 	if !messageID.MatchString(id) {
-		return "", ErrUncertain
+		requestID, _ := awsmiddleware.GetRequestIDMetadata(out.ResultMetadata)
+		response, _ := awsmiddleware.GetRawResponse(out.ResultMetadata).(*smithyhttp.Response)
+		return "", newSESFailure(ErrUncertain, response, "", requestID)
 	}
 	return id, nil
 }

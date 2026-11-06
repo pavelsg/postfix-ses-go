@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 root = Path(__file__).parent
 with (root / 'calls').open('a') as calls:
-    print(json.dumps([sys.argv[1:], os.environ['AWS_REGION']]), file=calls)
+    print(json.dumps([sys.argv[1:], os.environ['AWS_REGION'], os.environ.get('POSTFIX_SES_SMOKE_DIAGNOSTICS')]), file=calls)
 (root / 'raw').write_bytes(sys.stdin.buffer.read())
 mode = os.environ.get('FIXTURE', 'accept')
 if mode == 'defer':
@@ -84,7 +84,7 @@ print(f'postfix-ses-go: queue_id={queue_id} ses_message_id=example-001')
         self.assertEqual(receipt["ses_message_id"], "example-001")
         calls = (self.root / "calls").read_text().splitlines()
         self.assertEqual(len(calls), 1)
-        self.assertEqual(json.loads(calls[0]), [[SENDER, RECIPIENT, receipt["marker"]], "us-east-1"])
+        self.assertEqual(json.loads(calls[0]), [[SENDER, RECIPIENT, receipt["marker"]], "us-east-1", "1"])
         raw = (self.root / "raw").read_bytes()
         self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
         inbox = BytesParser(policy=policy.SMTP).parsebytes(raw)
@@ -125,15 +125,31 @@ print(f'postfix-ses-go: queue_id={queue_id} ses_message_id=example-001')
     def test_exit_75_reports_only_recognized_diagnostics(self) -> None:
         """Keep the binary's safe deferral reason and suppress unexpected child output."""
         prefix = "4.3.0 postfix-ses-go: "
+        configuration = prefix + "SES configuration unavailable"
+        uncertain = prefix + "SES acceptance uncertain queue_id={marker}"
+        detail = "\npostfix-ses-go-smoke: "
+        service = detail + "stage=ses http_status=403 aws_code=AccessDeniedException request_id="
+        request_id = "01234567-89ab-cdef-0123-456789abcdef"
         cases = [
-            (prefix + "SES configuration unavailable", True),
+            (configuration, True),
             (prefix + "SES throttled request", True),
             (prefix + "SES submission failed", True),
             (prefix + "unsupported envelope address", True),
-            (prefix + "SES acceptance uncertain queue_id={marker}", True),
+            (uncertain, True),
+            (uncertain + detail + "stage=transport", True),
+            (configuration + detail + "stage=setup", True),
+            (configuration + service + request_id, True),
+            (configuration + detail + "stage=ses http_status=503 aws_code=Unknown request_id=unknown", True),
             (prefix + "sensitive fixture diagnostic", False),
             (prefix + "SES configuration unavailable\nsensitive fixture diagnostic", False),
             (prefix + "SES acceptance uncertain queue_id=sensitive fixture diagnostic", False),
+            (prefix + "unknown reason" + service + request_id, False),
+            (configuration + service + "sensitive fixture diagnostic", False),
+            (configuration + service + request_id + "\ninjected", False),
+            (configuration + service.replace("403", "600") + request_id, False),
+            (configuration + service.replace("AccessDeniedException", "PrivateToken") + request_id, False),
+            (configuration + detail + "stage=setup\r", False),
+            (configuration + detail + "stage=setup\n", False),
         ]
         for attempt, (diagnostic, recognized) in enumerate(cases, 1):
             with self.subTest(diagnostic=diagnostic):
@@ -150,6 +166,7 @@ print(f'postfix-ses-go: queue_id={queue_id} ses_message_id=example-001')
                 else:
                     self.assertNotIn("sensitive fixture diagnostic", result.stderr)
                     self.assertNotIn(prefix, result.stderr)
+                    self.assertNotIn("postfix-ses-go-smoke:", result.stderr)
 
     def test_failure_or_lost_ack_never_retried(self) -> None:
         """Failed and ambiguous sends produce no receipt, and leak no provider diagnostic."""

@@ -158,6 +158,8 @@ python3 scripts/live-smoke.py send --send-live \
     --sender sender@example.test --recipient inbox@example.test > receipt.json
 ```
 
+On a temporary failure, the smoke driver can report which stage failed. `stage=setup` points to local SDK configuration or credential lookup. `stage=transport` indicates that the SDK has no HTTP response to inspect. For an SES response, look for the HTTP status, AWS error code, and request ID. These fields come from the current attempt and can help diagnose a rejection even without a CloudTrail record. The driver enables this detail only for its child process.
+
 Export the received message from the designated mailbox as `received.eml` and the corresponding SES Delivery event as `delivery.json`. For SNS, save the decoded inner `Message` JSON object. Check those files against the saved receipt offline:
 
 ```sh

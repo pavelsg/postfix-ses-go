@@ -139,6 +139,12 @@ func TestNoReplay(t *testing.T) {
 				fmt.Fprint(w, tc.body)
 			})
 			id, err := Send(attemptContext(t), "sender@example.org", "rcpt@example.org", []byte("raw"))
+			if tc.status == 0 && SmokeDiagnostic(err) != "stage=transport" {
+				t.Errorf("lost response diagnostic = %q", SmokeDiagnostic(err))
+			}
+			if tc.status == 200 && SmokeDiagnostic(err) != "stage=ses http_status=200 aws_code=Unknown request_id=unknown" {
+				t.Errorf("invalid acknowledgement diagnostic = %q", SmokeDiagnostic(err))
+			}
 			if id != "" || !errors.Is(err, tc.want) || requests.Load() != 1 {
 				t.Fatalf("Send: id=%q err=%v requests=%d", id, err, requests.Load())
 			}
@@ -187,7 +193,7 @@ func TestRejectedRequest(t *testing.T) {
 			const raw = "From: a@example.org\r\nSubject: one\r\nsUbJeCt: two\r\n" +
 				"Received: first\r\nReceived: second\r\nDate: today\r\n\r\nDate: this is body text"
 			id, err := Send(attemptContext(t), "sender@example.org", "rcpt@example.org", []byte(raw))
-			if id != "" || err != tc.want || requests.Load() != 1 {
+			if id != "" || !errors.Is(err, tc.want) || requests.Load() != 1 {
 				t.Fatalf("Send: id=%q err=%v requests=%d", id, err, requests.Load())
 			}
 		})
@@ -216,7 +222,7 @@ func TestCancelledSend(t *testing.T) {
 		}
 		id, err := Send(ctx, "sender@example.org", "rcpt@example.org", []byte("raw"))
 		cancel()
-		if id != "" || err != want || requests.Load() != wantRequests {
+		if id != "" || !errors.Is(err, want) || requests.Load() != wantRequests {
 			t.Fatalf("afterWrite=%v: id=%q err=%v requests=%d", afterWrite, id, err, requests.Load())
 		}
 	}
@@ -270,7 +276,7 @@ func TestConfig(t *testing.T) {
 
 // TestAttemptsRequireDeadline makes a bounded lifetime part of the adapter contract.
 func TestAttemptsRequireDeadline(t *testing.T) {
-	if _, err := Send(context.Background(), "sender@example.org", "rcpt@example.org", []byte("raw")); err != ErrConfiguration {
+	if _, err := Send(context.Background(), "sender@example.org", "rcpt@example.org", []byte("raw")); !errors.Is(err, ErrConfiguration) {
 		t.Fatalf("unbounded Send returned %v", err)
 	}
 }
@@ -292,5 +298,51 @@ func TestMailbox(t *testing.T) {
 		if got != tc.want || (err == nil) != (tc.want != "") {
 			t.Errorf("mailbox(%q) = %q, %v; want %q", tc.input, got, err, tc.want)
 		}
+	}
+}
+
+// TestSmokeResponseDiagnostic verifies real SDK error decoding and redaction.
+// Neither the SDK response body nor unrecognized header values may escape.
+func TestSmokeResponseDiagnostic(t *testing.T) {
+	const validID = "8d7b7fd6-8cc2-4e61-957f-2606a5eb9ca7"
+	for _, tc := range []struct {
+		name, code, id, want string
+	}{
+		{"allowed", "AccessDeniedException", validID, "aws_code=AccessDeniedException request_id=" + validID},
+		{"untrusted values", "SecretProviderCode", "sensitive@example.org", "aws_code=Unknown request_id=unknown"},
+		{"no headers", "", "", "aws_code=Unknown request_id=unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configureTest(t)
+			var requests atomic.Int32
+			endpoint(t, func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("X-Amzn-Errortype", tc.code)
+				w.Header().Set("X-Amzn-Requestid", tc.id)
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"message":"private provider diagnostic"}`)
+			})
+			id, err := Send(attemptContext(t), "a@example.org", "b@example.org", []byte("raw"))
+			if id != "" || !errors.Is(err, ErrConfiguration) || err.Error() != ErrConfiguration.Error() || requests.Load() != 1 {
+				t.Fatalf("id=%q, err=%v, requests=%d", id, err, requests.Load())
+			}
+			want := "stage=ses http_status=403 " + tc.want
+			if got := SmokeDiagnostic(fmt.Errorf("wrapper: %w", err)); got != want {
+				t.Fatalf("SmokeDiagnostic() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestSmokeDiagnosticSetup identifies failure before any send request is possible.
+func TestSmokeDiagnosticSetup(t *testing.T) {
+	configureTest(t)
+	t.Setenv("AWS_REGION", "")
+	_, err := Send(attemptContext(t), "a@example.org", "b@example.org", []byte("raw"))
+	if !errors.Is(err, ErrConfiguration) || SmokeDiagnostic(err) != "stage=setup" {
+		t.Fatalf("err=%v, diagnostic=%q", err, SmokeDiagnostic(err))
+	}
+	if SmokeDiagnostic(errors.New("private detail")) != "" || SmokeDiagnostic(nil) != "" {
+		t.Fatal("unrelated error produced a diagnostic")
 	}
 }
