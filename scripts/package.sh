@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Build, smoke-test, and archive one release on its target Linux architecture.
+# Usage: bash scripts/package.sh vMAJOR.MINOR.PATCH OUTPUT_DIRECTORY
+set -euo pipefail
+
+if [[ $# -ne 2 || -z $2 ]]; then
+    echo "Usage: bash scripts/package.sh vMAJOR.MINOR.PATCH OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+
+version=$1
+number='(0|[1-9][0-9]*)'
+if [[ ! $version =~ ^v${number}\.${number}\.${number}$ ]]; then
+    echo "Expected a stable release tag such as v1.2.3." >&2
+    exit 2
+fi
+
+if [[ $(go env GOHOSTOS) != linux ]]; then
+    echo "Build release archives on a native Linux runner." >&2
+    exit 1
+fi
+arch=$(go env GOHOSTARCH)
+case "$arch" in
+    amd64|arm64) ;;
+    *) echo "Unsupported Linux architecture: $arch" >&2; exit 1 ;;
+esac
+
+mkdir -p -- "$2"
+out_dir=$(cd -- "$2" && pwd)
+repo_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd -- "$repo_dir"
+
+# Stage on the output filesystem so a failed build cannot leave a partial asset.
+stage=$(mktemp -d -- "$out_dir/.package.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+binary=postfix-ses-go
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false \
+    -ldflags "-X main.version=$version" -o "$stage/$binary" "./cmd/$binary"
+
+actual_version=$("$stage/$binary" --version)
+if [[ $actual_version != "$binary $version" ]]; then
+    echo "Unexpected version in release binary: $actual_version" >&2
+    exit 1
+fi
+
+# While delivery is scaffolded, a pipe invocation must defer the queued message.
+delivery_status=0
+"$stage/$binary" </dev/null >/dev/null 2>&1 || delivery_status=$?
+if [[ $delivery_status -ne 75 ]]; then
+    echo "Expected a temporary delivery failure (75), got $delivery_status." >&2
+    exit 1
+fi
+
+install -m 0644 LICENSE README.md "$stage/"
+archive="${binary}_${version}_linux_${arch}.tar.gz"
+# Normalize ownership and timestamps so runner metadata stays out of releases.
+tar -C "$stage" --format=ustar --owner=0 --group=0 --mtime=@0 \
+    -cf - "$binary" LICENSE README.md | gzip -n > "$stage/$archive"
+mv -- "$stage/$archive" "$out_dir/$archive"
+printf '%s\n' "$out_dir/$archive"
