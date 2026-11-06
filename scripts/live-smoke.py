@@ -20,6 +20,19 @@ REGION = re.compile(r"[a-z]+(?:-[a-z0-9]+)+-[0-9]+")
 MARKER = re.compile(r"[a-f0-9]{32}")
 DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
+# The caller supplies the executable. Only its known, sender-safe EX_TEMPFAIL
+# lines may be copied to the smoke log; a prefix alone cannot establish that.
+TEMPFAIL_DIAGNOSTICS = {
+    b"4.3.0 postfix-ses-go: invalid pipe arguments",
+    b"4.3.0 postfix-ses-go: null sender is not eligible for SES",
+    b"4.3.0 postfix-ses-go: cannot read message",
+    b"4.3.0 postfix-ses-go: invalid pipe message framing",
+    b"4.3.0 postfix-ses-go: SES configuration unavailable",
+    b"4.3.0 postfix-ses-go: SES throttled request",
+    b"4.3.0 postfix-ses-go: unsupported envelope address",
+    b"4.3.0 postfix-ses-go: SES submission failed",
+}
+
 
 def mailbox(value: str) -> str:
     """Require one plain ASCII addr-spec suitable for a synthetic pipe invocation."""
@@ -55,6 +68,13 @@ def send(binary: Path, region: str, sender: str, recipient: str) -> dict:
                             env={**os.environ, "AWS_REGION": region},
                             input=message.as_bytes(), capture_output=True, timeout=30)
     if result.returncode:
+        diagnostic = result.stderr.removesuffix(b"\n")
+        if result.returncode == 75:
+            if diagnostic in TEMPFAIL_DIAGNOSTICS:
+                raise ValueError(f"delivery agent exited 75: {diagnostic.decode('ascii')}")
+            if diagnostic == f"4.3.0 postfix-ses-go: SES acceptance uncertain queue_id={marker}".encode():
+                raise ValueError(f"delivery agent exited 75: {diagnostic.decode('ascii')}. "
+                                 "Inspect mailbox and events before resending")
         if result.returncode < 0 or b"acceptance uncertain" in result.stderr:
             raise ValueError("SES acceptance uncertain. Inspect mailbox and events before resending")
         raise ValueError(f"delivery agent exited {result.returncode}. No acceptance confirmed")
