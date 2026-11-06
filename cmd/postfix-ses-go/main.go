@@ -2,62 +2,92 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
+
+	"github.com/pavelsg/postfix-ses-go/internal/message"
+	"github.com/pavelsg/postfix-ses-go/internal/sestransport"
 )
 
 // Release builds set version using the linker's -X main.version option.
 var version = "dev"
 
-// Postfix keeps the recipient queued when a pipe transport returns EX_TEMPFAIL.
-const exitTempFail = 75
-
-// The limit applies to the complete message as serialized by the Postfix pipe.
-const maxMessageBytes = 10 << 20
+const (
+	exitTempFail    = 75
+	maxMessageBytes = 10 << 20
+	// Leave time to return a diagnostic before the reference transport's 30s cutoff.
+	attemptTimeout = 20 * time.Second
+)
 
 // Both short and long Postfix queue IDs use ASCII letters and digits.
 var queueIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 
-// main passes the process exit status back to Postfix.
+// sendEmail returns the accepted SES message ID or a classified transport error.
+type sendEmail func(context.Context, string, string, []byte) (string, error)
+
+// main passes the delivery outcome back to Postfix.
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, sestransport.Send))
 }
 
-// run prints the version on request. Until delivery is implemented, every
-// other invocation must defer without echoing envelope or message data.
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+// run accepts one Postfix delivery or a standalone version query.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, send sendEmail) int {
 	if len(args) == 1 && args[0] == "--version" {
 		if _, err := fmt.Fprintln(stdout, "postfix-ses-go", version); err != nil {
 			return exitTempFail
 		}
 		return 0
 	}
-	// Postfix interprets a leading enhanced status before the process exit code.
-	fmt.Fprintln(stderr, "4.3.0 postfix-ses-go:", deliveryDiagnostic(args, stdin))
-	return exitTempFail
-}
-
-// deliveryDiagnostic validates the pipe invocation and consumes a bounded
-// message. All outcomes currently defer; diagnostics may be visible to senders.
-func deliveryDiagnostic(args []string, stdin io.Reader) string {
-	// Postfix supplies the envelope, including a possible null sender. Leave
-	// mailbox quoting and spelling intact instead of parsing header addresses.
+	// Only log a queue ID once validated. Command output may appear in a DSN.
 	if len(args) != 3 || args[1] == "" || !queueIDPattern.MatchString(args[2]) ||
 		strings.ContainsFunc(args[0], unicode.IsControl) || strings.ContainsFunc(args[1], unicode.IsControl) {
-		return "invalid pipe arguments"
+		return deferDelivery(stderr, "invalid pipe arguments")
 	}
 
-	// One lookahead byte distinguishes an exact-limit message from overflow.
-	n, err := io.Copy(io.Discard, io.LimitReader(stdin, maxMessageBytes+1))
+	sender, recipient, queueID := args[0], args[1], args[2]
+	if sender == "" {
+		return deferDelivery(stderr, "null sender is not eligible for SES")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+	defer cancel()
+	raw, err := io.ReadAll(io.LimitReader(stdin, maxMessageBytes+1))
 	if err != nil {
-		return "cannot read message"
+		return deferDelivery(stderr, "cannot read message")
 	}
-	if n > maxMessageBytes {
-		return "message exceeds 10 MiB"
+	if len(raw) > maxMessageBytes {
+		return deferDelivery(stderr, "message exceeds 10 MiB")
 	}
-	return "delivery is not implemented"
+	raw, err = message.Prepare(raw)
+	if err != nil {
+		return deferDelivery(stderr, "invalid message headers")
+	}
+
+	id, err := send(ctx, sender, recipient, raw)
+	switch {
+	case err == nil && id != "":
+		// Once SES accepted the message, a log write error must not trigger a retry.
+		fmt.Fprintf(stdout, "postfix-ses-go: queue_id=%s ses_message_id=%s\n", queueID, id)
+		return 0
+	case err == nil || errors.Is(err, sestransport.ErrUncertain):
+		return deferDelivery(stderr, "SES acceptance uncertain queue_id="+queueID)
+	case errors.Is(err, sestransport.ErrConfiguration):
+		return deferDelivery(stderr, "SES configuration unavailable")
+	case errors.Is(err, sestransport.ErrAddress):
+		return deferDelivery(stderr, "unsupported envelope address")
+	default:
+		return deferDelivery(stderr, "SES submission failed")
+	}
+}
+
+// deferDelivery pairs the process exit with the enhanced status Postfix reads first.
+func deferDelivery(stderr io.Writer, diagnostic string) int {
+	fmt.Fprintln(stderr, "4.3.0 postfix-ses-go:", diagnostic)
+	return exitTempFail
 }
