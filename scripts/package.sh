@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, smoke-test, and archive one release on its target Linux architecture.
+# Build and smoke-test one native Linux archive and write its SHA-256 sidecar.
 # Usage: bash scripts/package.sh vMAJOR.MINOR.PATCH OUTPUT_DIRECTORY
 set -euo pipefail
 
@@ -57,6 +57,7 @@ if [[ $diagnostic != '4.3.0 postfix-ses-go: SES configuration unavailable' ]]; t
 fi
 
 install -m 0644 LICENSE README.md .env.example "$stage/"
+install -D -m 0644 scripts/live-smoke.py "$stage/scripts/live-smoke.py"
 install -d "$stage/licenses"
 aws_sdk=$(go list -m -f '{{.Dir}}' github.com/aws/aws-sdk-go-v2)
 smithy=$(go list -m -f '{{.Dir}}' github.com/aws/smithy-go)
@@ -71,6 +72,8 @@ install -m 0644 examples/postfix/forwarding/aliases.fragment "$stage/examples/po
 archive="${binary}_${version}_linux_${arch}.tar.gz"
 # Normalize ownership and timestamps so runner metadata stays out of releases.
 tar -C "$stage" --format=ustar --owner=0 --group=0 --mtime=@0 \
-    --sort=name -cf - "$binary" LICENSE README.md .env.example examples licenses | gzip -n > "$stage/$archive"
+    --sort=name -cf - "$binary" LICENSE README.md .env.example examples licenses scripts | gzip -n > "$stage/$archive"
+(cd "$stage" && sha256sum "$archive" > "$archive.sha256")
 mv -- "$stage/$archive" "$out_dir/$archive"
+mv -- "$stage/$archive.sha256" "$out_dir/$archive.sha256"
 printf '%s\n' "$out_dir/$archive"

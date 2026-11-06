@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Untagged builds use a qualification label without creating a Git tag.
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.1' }}
+
 jobs:
   build:
     name: Test and package Linux ${{ matrix.arch }}
@@ -22,13 +30,12 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
-    env:
-      # The packager validates stable version tags; ordinary builds use a smoke-test version.
-      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The queued upgrade/rollback test builds a pinned earlier revision.
+          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Release builds use stable Go; go.mod declares the minimum source-compatible version.
@@ -43,23 +50,55 @@ jobs:
           fi
       - run: go vet ./...
       - run: go test ./...
-      - name: Verify Postfix routing, SES handoff and queue recovery
-        run: bash tests/postfix/test.sh
-      - name: Build and smoke-test release archive
-        run: bash scripts/package.sh "$VERSION" dist
-      - name: Stage archive for release
-        if: github.ref_type == 'tag'
+      - name: Test the live-smoke driver offline
+        run: python3 -m unittest discover -s tests/live-smoke -v
+      - name: Qualify release archive, real queue, upgrade and rollback
+        run: bash scripts/qualify.sh "$VERSION" dist
+      - name: Stage qualified archive and checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/postfix-ses-go_${{ env.VERSION }}_linux_${{ matrix.arch }}.tar.gz
+          path: |
+            dist/postfix-ses-go_${{ env.VERSION }}_linux_${{ matrix.arch }}.tar.gz
+            dist/postfix-ses-go_${{ env.VERSION }}_linux_${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  bundle:
+    name: Verify two-architecture release bundle
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble SHA256SUMS from verified native-job checksums
+        working-directory: dist
+        run: |
+          for arch in amd64 arm64; do
+            file="postfix-ses-go_${VERSION}_linux_${arch}.tar.gz"
+            sha256sum "$file" | cmp - "$file.sha256"
+            cat "$file.sha256" >> SHA256SUMS
+          done
+          sha256sum --strict --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle
+          path: |
+            dist/postfix-ses-go_${{ env.VERSION }}_linux_amd64.tar.gz
+            dist/postfix-ses-go_${{ env.VERSION }}_linux_arm64.tar.gz
+            dist/SHA256SUMS
           if-no-files-found: error
           compression-level: 0
           overwrite: true
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: bundle
     if: github.repository == 'pavelsg/postfix-ses-go' && github.event_name == 'push' && github.ref_type == 'tag'
     permissions:
       contents: write
@@ -69,16 +108,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: linux-*
+          name: release-bundle
           path: dist
-          merge-multiple: true
-      - name: Publish both archives and their SHA-256 checksums
+      - name: Verify and publish qualified assets
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.ref_name }}
         run: |
           archives=("postfix-ses-go_${VERSION}_linux_amd64.tar.gz" "postfix-ses-go_${VERSION}_linux_arm64.tar.gz")
-          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum "${archives[@]}" | cmp - SHA256SUMS
           gh release create "$VERSION" "${archives[@]}" SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

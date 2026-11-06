@@ -2,7 +2,7 @@
 
 A Go delivery agent under development for Postfix operators who want to route selected outbound mail through the Amazon SES v2 HTTPS API. Postfix chooses the route and owns the queue. The agent submits one envelope recipient per invocation. The [project goals](https://github.com/pavelsg/postfix-ses-go/blob/HEAD/GOAL.md) describe routing, failure handling, and release acceptance criteria.
 
-**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Real Postfix queue tests cover transport selection, local delivery, redirects, SES handoff, bounces and recovery. Live SES delivery and tracking qualification are pending. Test installations with real AWS credentials and an opted-in sender can send real mail.
+**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Release qualification exercises the packaged Linux binaries with a real Postfix queue, including upgrade and rollback. A separate opt-in smoke test checks live SES acceptance, mailbox delivery, and event tracking using an operator's resources. Test installations with real AWS credentials and an opted-in sender can send real mail.
 
 ## Postfix pipe contract
 
@@ -89,28 +89,83 @@ With Docker available, run `bash tests/postfix/test.sh` for the full queue suite
 
 ## Release workflow
 
-Branch pushes and pull requests run formatting checks, vet, tests, and packaging on native Linux amd64 and arm64 runners. Stable version tags run the same checks and publish both archives and a `SHA256SUMS` file once both builds pass. Each archive includes the executable, the Postfix and environment examples, this README, the project license, and dependency notices.
+### Qualify a Linux release
 
-To build a candidate archive locally on a supported Linux host, run:
+On native Linux amd64 and arm64, CI builds the versioned archive, verifies its SHA-256 checksum and exercises the extracted binary **and its shipped configuration** on Debian 12 with Postfix 3.7.11. Each runner also checks that changing the archive makes checksum verification fail. CI assembles both qualified archives and their combined `SHA256SUMS` into the downloadable `release-bundle` workflow artifact. Stable release tags publish those qualified bytes to GitHub Releases after both architectures pass.
+
+To reproduce one architecture's qualification, use a native Linux checkout with Go, Docker, and Git history containing the baseline commit:
 
 ```sh
-bash scripts/package.sh v0.1.0 dist
+bash scripts/qualify.sh v0.0.1 dist
 ```
 
-Once the release criteria in `GOAL.md` are met, a maintainer can trigger publication by pushing a stable version tag. Use the `github-pavelsg` SSH alias for the `pavelsg` repository. For example, for a reviewed commit at HEAD:
+Until the first release, the rollback baseline is built separately from the merged phase 4 commit `4aa13814c5a8c282f01f1995c74adbec84d3faf8`. The baseline and candidate get distinct test version labels. The rehearsal defers a recipient, installs the candidate, and lets Postfix retry the same queue ID. It repeats in the other direction with mail queued under the candidate. The controlled endpoint checks the message bytes on each attempt. When a published release becomes the supported upgrade baseline, update the pinned commit and test version in the qualification script.
+
+To publish an approved stable version after meeting the release criteria in `GOAL.md`, tag the reviewed commit and push the tag through `github-pavelsg`. For example:
 
 ```sh
 git tag -a v0.1.0 -m 'Release v0.1.0'
 git push git@github-pavelsg:pavelsg/postfix-ses-go.git refs/tags/v0.1.0
 ```
 
-To verify a download, place your architecture's archive and `SHA256SUMS` in a directory and run this Linux command there before extracting:
+### Verify and install an archive
 
-```sh
-sha256sum --check --ignore-missing SHA256SUMS
+Use a fresh directory and obtain the pinned archive and `SHA256SUMS` from the same trusted release or CI artifact. For the complete two-architecture bundle, run `sha256sum --strict --check SHA256SUMS`. For a single downloaded archive, use the following in a Bash shell on Linux. Set `version` to the version you downloaded.
+
+```bash
+set -eu
+version=v0.0.1
+case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) echo "Unsupported architecture" >&2; exit 1 ;;
+esac
+archive="postfix-ses-go_${version}_linux_${arch}.tar.gz"
+actual=$(sha256sum -- "$archive")
+grep -Fx -- "$actual" SHA256SUMS
+mkdir "release-$version"
+tar -xzf "$archive" -C "release-$version"
+"release-$version/postfix-ses-go" --version
 ```
 
-Check that the output names your downloaded archive and reports `OK`.
+For a regular-file installation at the reference pipe path, keep the verified previous release in its own directory. Record any affected queue IDs with `postqueue -p`. Run the replacement below as the administrator, from the directory containing the verified release trees:
+
+```bash
+set -eu
+version=v0.0.1
+binary=/usr/local/libexec/postfix-ses-go
+test -d /usr/local/libexec
+staged=$(mktemp /usr/local/libexec/.postfix-ses-go.XXXXXXXX)
+trap 'rm -f -- "$staged"' EXIT
+install -o root -g root -m 0755 "release-$version/postfix-ses-go" "$staged"
+cmp "release-$version/postfix-ses-go" "$staged"
+test "$("$staged" --version)" = "postfix-ses-go $version"
+mv -fT -- "$staged" "$binary"
+"$binary" --version
+```
+
+The same-directory rename activates the binary for the next pipe invocation. A running invocation can finish with its original binary. **To roll back**, repeat the replacement with the verified previous version. Keep the pipe path, Postfix configuration, and queue files in place in both directions. Follow the original queue IDs in the log. Before forcing a retry, inspect any uncertain SES acceptance because a second send can duplicate delivery.
+
+### Opt-in live SES smoke test
+
+Use the verified Linux binary, Python 3.9 or newer, a send-only AWS identity, a verified sender in the chosen region, and a mailbox you control. Configure the SES sending identity's default configuration set to publish Delivery events to a destination you can inspect. The send and evidence-verification steps are separate. The [SES event format](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html) describes the message ID assigned at acceptance and the recipients confirmed by the remote mail server.
+
+From the extracted package directory, substitute your own region and plain ASCII sender and recipient addresses. Leave the custom SES endpoint unset. The following command invokes the packaged binary directly with a unique smoke marker as its queue ID. It sends **one real message** and saves the acceptance receipt:
+
+```sh
+python3 scripts/live-smoke.py send --send-live \
+    --binary ./postfix-ses-go --region us-east-1 \
+    --sender sender@example.test --recipient inbox@example.test > receipt.json
+```
+
+Export the received message from the designated mailbox as `received.eml` and the corresponding SES Delivery event as `delivery.json`. For SNS, save the decoded inner `Message` JSON object. Check those files against the saved receipt offline:
+
+```sh
+python3 scripts/live-smoke.py verify --receipt receipt.json \
+    --message received.eml --event delivery.json
+```
+
+Add `--configuration-set NAME` to the verification command to check the event's configuration-set tag. A receipt records SES acceptance. A passing verification additionally matches the mailbox copy and the Delivery event to the probe. If acceptance was uncertain, investigate the existing attempt before running another send. Routine CI uses test credentials, local endpoints, and offline smoke fixtures.
 
 ## License and attribution
 
