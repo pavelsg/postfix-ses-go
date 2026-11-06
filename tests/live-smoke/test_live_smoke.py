@@ -34,6 +34,9 @@ with (root / 'calls').open('a') as calls:
     print(json.dumps([sys.argv[1:], os.environ['AWS_REGION']]), file=calls)
 (root / 'raw').write_bytes(sys.stdin.buffer.read())
 mode = os.environ.get('FIXTURE', 'accept')
+if mode == 'defer':
+    print(os.environ['DIAGNOSTIC'].replace('{marker}', sys.argv[3]), file=sys.stderr)
+    sys.exit(75)
 if mode == 'uncertain':
     print('4.3.0 postfix-ses-go: SES acceptance uncertain', file=sys.stderr)
     sys.exit(75)
@@ -118,6 +121,35 @@ print(f'postfix-ses-go: queue_id={queue_id} ses_message_id=example-001')
         (self.root / "inbox").write_bytes(inbox.as_bytes())
         self.assertNotEqual(self.invoke(self.verify).returncode, 0)
         self.assertEqual((self.root / "calls").read_text().splitlines(), calls)
+
+    def test_exit_75_reports_only_recognized_diagnostics(self) -> None:
+        """Keep the binary's safe deferral reason and suppress unexpected child output."""
+        prefix = "4.3.0 postfix-ses-go: "
+        cases = [
+            (prefix + "SES configuration unavailable", True),
+            (prefix + "SES throttled request", True),
+            (prefix + "SES submission failed", True),
+            (prefix + "unsupported envelope address", True),
+            (prefix + "SES acceptance uncertain queue_id={marker}", True),
+            (prefix + "sensitive fixture diagnostic", False),
+            (prefix + "SES configuration unavailable\nsensitive fixture diagnostic", False),
+            (prefix + "SES acceptance uncertain queue_id=sensitive fixture diagnostic", False),
+        ]
+        for attempt, (diagnostic, recognized) in enumerate(cases, 1):
+            with self.subTest(diagnostic=diagnostic):
+                result = self.invoke(self.send + ["--send-live"], FIXTURE="defer", DIAGNOSTIC=diagnostic)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                calls = (self.root / "calls").read_text().splitlines()
+                self.assertEqual(len(calls), attempt)
+                if recognized:
+                    marker = json.loads(calls[-1])[0][-1]
+                    self.assertIn("exited 75: " + diagnostic.replace("{marker}", marker), result.stderr)
+                    if "{marker}" in diagnostic:
+                        self.assertIn("Inspect mailbox and events before resending", result.stderr)
+                else:
+                    self.assertNotIn("sensitive fixture diagnostic", result.stderr)
+                    self.assertNotIn(prefix, result.stderr)
 
     def test_failure_or_lost_ack_never_retried(self) -> None:
         """Failed and ambiguous sends produce no receipt, and leak no provider diagnostic."""
