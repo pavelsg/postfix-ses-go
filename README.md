@@ -2,7 +2,7 @@
 
 A Go delivery agent under development for Postfix operators who want to route selected outbound mail through the Amazon SES v2 HTTPS API. Postfix chooses the route and owns the queue. The agent submits one envelope recipient per invocation. The [project goals](https://github.com/pavelsg/postfix-ses-go/blob/HEAD/GOAL.md) describe routing, failure handling, and release acceptance criteria.
 
-**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Real Postfix queue tests cover handoff, deferral, bounces, and recovery against a controlled endpoint. The full routing suite and live SES qualification are pending. Test installations with real AWS credentials and an opted-in sender can send real mail.
+**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Real Postfix queue tests cover transport selection, local delivery, redirects, SES handoff, bounces and recovery. Live SES delivery and tracking qualification are pending. Test installations with real AWS credentials and an opted-in sender can send real mail.
 
 ## Postfix pipe contract
 
@@ -54,7 +54,25 @@ By default the SDK resolves the regional SES endpoint. For a controlled endpoint
 3. Install `examples/postfix/ses_senders` as `/etc/postfix/ses_senders`. Each anchored regular expression selects one full envelope sender address, using Postfix's default case-insensitive matching. Escape regex metacharacters in actual addresses, including dots and plus signs. Use a separate row for each opted-in alias. Omit domain-wide and null-sender entries. Run `postfix check`, then `postfix reload`.
 4. Submit a test message from a listed sender to an operator-controlled recipient. Follow the queue ID in the Postfix log. On the tested Postfix version, a confirmed handoff logs `status=sent` with the SES ID. A deferred recipient remains visible in `postqueue -p`. Remove the test sender entry and reload Postfix to end the trial.
 
-The sender map selects the default outbound transport. Keep sender authorization and redirect handling in the installation that knows the origin of the message. Preserve existing local and forwarding routes when merging these examples. The examples require the `regexp` backend listed by `postconf -m`. Postfix reads this text map directly.
+### Routing a mailbox and its sending aliases
+
+The sender map applies to external recipients that use the default transport. Postfix selects the local delivery transport for hosted recipients in `mydestination`. A recipient-specific transport override can take precedence, so check the installation’s existing `transport_maps` when adopting the example. The `regexp` backend must be listed by `postconf -m`.
+
+For a site hosting `example.test` with a local mailbox named `sender`, merge `examples/postfix/mailbox-aliases.fragment` into the local aliases database (typically `/etc/aliases`) and run `newaliases`. It makes `billing` and `support` incoming aliases of the same mailbox. Outbound opt-in is a separate decision. The supplied `ses_senders` lists `sender@example.test` and `billing@example.test`. Each address must be authorized by the installation before submission.
+
+| Envelope sender | Envelope recipients | Delivery with the example maps |
+| --- | --- | --- |
+| `sender@example.test` or `billing@example.test` | External recipient | One SES handoff for that recipient |
+| `support@example.test`, an unlisted mailbox, or `sender+tag@example.test` | External recipient | The site's default outbound route |
+| `sender@example.test` | A hosted mailbox and an external recipient in the same message | Postfix delivers the local copy and invokes the SES pipe only for the external recipient |
+
+### Redirecting a local alias over SMTP
+
+The optional `examples/postfix/forwarding/aliases.fragment` configures a hosted `redirect` alias and its companion `owner-redirect`. Merge the entries into the local aliases database, adapt the external target, and point the owner alias to a monitored local mailbox. Run `newaliases`. This policy assumes stock `local(8)` alias expansion with `expand_owner_alias = no`, a locally deliverable owner address at `$myorigin`, and a default outbound SMTP route. Keep that owner address outside the SES sender map.
+
+When Postfix expands `redirect`, it assigns `owner-redirect@$myorigin` as the envelope sender of the forwarded copy. That copy takes the site's ordinary SMTP route and retains the author's From header. Delivery failures go to the monitored owner mailbox. Direct mail from the opted-in sender to the very same external target still uses SES.
+
+This example applies to aliases expanded by `local(8)`. For virtual aliases or panel-managed redirects, apply the forwarding policy where that installation recognizes the redirect. A sender map alone sees only the resulting envelope sender. [Postfix local delivery](https://www.postfix.org/local.8.html) · [Postfix owner-alias settings](https://www.postfix.org/postconf.5.html#expand_owner_alias)
 
 ## Local development
 
@@ -67,7 +85,7 @@ go build -o bin/postfix-ses-go ./cmd/postfix-ses-go
 ./bin/postfix-ses-go --version
 ```
 
-With Docker available, run `bash tests/postfix/test.sh` to exercise the real Postfix queue in a disposable container. The reference configuration has been exercised on Debian 12 with Postfix 3.7.11. The suite checks request counts, pipe exits, per-recipient queue state and Postfix diagnostics. It exercises acceptance, throttling, recoverable and permanent HTTP 400 responses, a lost acknowledgement, and an interrupted pipe. Recovery tests let Postfix schedule a later delivery of the same queue ID. Containers run with external networking disabled and use disposable test credentials.
+With Docker available, run `bash tests/postfix/test.sh` for the full queue suite, or `bash tests/postfix/test.sh routing redirect` for routing alone. The fixture installs the configuration examples into Debian 12 with Postfix 3.7.11. A loopback SMTP receiver, a controlled SES HTTPS endpoint and local mailboxes show where each recipient's copy went. The containers use disposable credentials and run with external networking disabled.
 
 ## Release workflow
 
