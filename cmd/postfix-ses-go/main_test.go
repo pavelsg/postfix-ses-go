@@ -169,15 +169,24 @@ func TestExecutable(t *testing.T) {
 	if err != nil || string(out) != "postfix-ses-go v0.1.2\n" {
 		t.Fatalf("release version: got output %q, err %v", out, err)
 	}
-	delivery := exec.Command(path, "private@example.org", "recipient@example.net", "123AB")
-	delivery.Env = []string{"AWS_REGION="}
-	delivery.Stdin = strings.NewReader("From: author@example.org\r\nSubject: private\r\n\r\nSensitive body\r\n")
-	out, err = delivery.CombinedOutput()
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 75 {
-		t.Fatalf("delivery: want exit code 75, got %v", err)
-	}
-	if string(out) != "4.3.0 postfix-ses-go: SES configuration unavailable\n" {
-		t.Fatalf("unexpected delivery diagnostic: %q", out)
+	for _, tc := range []struct {
+		mode   string
+		detail string
+	}{
+		{"", ""},
+		{"0", ""},
+		{"1", "postfix-ses-go-smoke: stage=setup\n"},
+	} {
+		delivery := exec.Command(path, "private@example.org", "recipient@example.net", "123AB")
+		delivery.Env = []string{"AWS_REGION=", "POSTFIX_SES_SMOKE_DIAGNOSTICS=" + tc.mode}
+		delivery.Stdin = strings.NewReader("From: author@example.org\r\nSubject: private\r\n\r\nSensitive body\r\n")
+		out, err = delivery.CombinedOutput()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 75 {
+			t.Fatalf("delivery: want exit code 75, got %v", err)
+		}
+		if string(out) != "4.3.0 postfix-ses-go: SES configuration unavailable\n"+tc.detail {
+			t.Fatalf("smoke diagnostics %q: unexpected output %q", tc.mode, out)
+		}
 	}
 }

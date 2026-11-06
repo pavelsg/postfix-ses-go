@@ -74,6 +74,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, send sendEmai
 	}
 
 	id, err := send(ctx, sender, recipient, raw)
+	if err != nil && os.Getenv("POSTFIX_SES_SMOKE_DIAGNOSTICS") == "1" {
+		if detail := sestransport.SmokeDiagnostic(err); detail != "" {
+			// Keep the enhanced Postfix status on the first line.
+			defer fmt.Fprintln(stderr, "postfix-ses-go-smoke:", detail)
+		}
+	}
 	switch {
 	case err == nil && id != "":
 		// Once SES accepted the message, a log write error must not trigger a retry.
