@@ -11,13 +11,15 @@ arch=$(docker image inspect "$image" --format '{{.Architecture}}')
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$work/postfix-ses-go" ./cmd/postfix-ses-go
 cp -R examples/postfix "$work/config"
 
-# Each fault gets an isolated queue and a peer with an independent request count.
+# Each scenario gets an isolated queue and independent delivery observations.
 if [[ $# -eq 0 ]]; then
-    set -- defer handoff throttle configuration permanent unknown lost-ack interrupted local-content
+    set -- defer handoff throttle configuration permanent unknown lost-ack interrupted local-content routing redirect
 fi
 for scenario in "$@"; do
     case "$scenario" in
         defer|handoff) driver=check_queue.py ;;
+        routing) driver=routing_queue.py ;;
+        redirect) driver=redirect_queue.py ;;
         *) driver=failure_queue.py ;;
     esac
     docker run --rm --network none --hostname mx.example.test \

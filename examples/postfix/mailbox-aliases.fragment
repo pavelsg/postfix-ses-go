@@ -1,0 +1,3 @@
+# Example local(8) aliases for the hosted mailbox named sender.
+billing: sender
+support: sender

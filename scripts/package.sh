@@ -65,8 +65,9 @@ install -m 0644 "$aws_sdk/NOTICE.txt" "$stage/licenses/aws-sdk-go-v2-NOTICE"
 install -m 0644 "$smithy/LICENSE" "$stage/licenses/smithy-go-LICENSE"
 install -m 0644 "$smithy/NOTICE" "$stage/licenses/smithy-go-NOTICE"
 install -m 0644 "$(go env GOROOT)/LICENSE" "$stage/licenses/go-LICENSE"
-install -d "$stage/examples/postfix"
-install -m 0644 examples/postfix/{main.cf.fragment,master.cf.fragment,ses_senders} "$stage/examples/postfix/"
+install -d "$stage/examples/postfix/forwarding"
+install -m 0644 examples/postfix/{main.cf.fragment,master.cf.fragment,ses_senders,mailbox-aliases.fragment} "$stage/examples/postfix/"
+install -m 0644 examples/postfix/forwarding/aliases.fragment "$stage/examples/postfix/forwarding/"
 archive="${binary}_${version}_linux_${arch}.tar.gz"
 # Normalize ownership and timestamps so runner metadata stays out of releases.
 tar -C "$stage" --format=ustar --owner=0 --group=0 --mtime=@0 \

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from ses_endpoint import Endpoint, MESSAGE_ID, Request, controlled_endpoint
@@ -21,8 +22,14 @@ NULL_ERROR = "4.3.0 postfix-ses-go: null sender is not eligible for SES"
 BODY = b"\r\n\r\nfirst line\r\n.dot-prefixed line\r\nlast line\r\n"
 
 
-def configure(*, handoff: bool, hold_bounces: bool = False) -> None:
-    """Apply the operator examples and route just the null-sender probe by recipient."""
+def configure(*, handoff: bool, hold_bounces: bool = False, settings: Sequence[str] = ()) -> None:
+    """Start an isolated Postfix using the operator examples and scenario overrides.
+
+    Args:
+        handoff: Export the SES fixture settings to Postfix's child processes.
+        hold_bounces: Queue the failure fixture's DSN for inspection.
+        settings: Additional postconf assignments to apply before startup.
+    """
     for name in ("main.cf", "master.cf"):
         with (POSTFIX / name).open("ab") as dest:
             dest.write(b"\n" + (CONFIG / (name + ".fragment")).read_bytes())
@@ -49,6 +56,8 @@ def configure(*, handoff: bool, hold_bounces: bool = False) -> None:
         for setting in ("import_environment", "export_environment"):
             defaults = subprocess.check_output(["postconf", "-h", setting], text=True).strip()
             subprocess.run(["postconf", "-e", f"{setting}={defaults}{names}"], check=True)
+    if settings:
+        subprocess.run(["postconf", "-e", *settings], check=True)
     CAPTURES.mkdir(mode=0o700)
     shutil.chown(CAPTURES, user="sespipe")
     print("Testing stock Postfix", subprocess.check_output(
@@ -126,9 +135,8 @@ def queue_entries() -> dict[str, dict]:
     return {entry["queue_id"]: entry for entry in entries}
 
 
-def receive_attempt(endpoint: Endpoint, sender: str, recipient: str) -> tuple[Request, bytes, str]:
-    """Wait for a full SES request and correlate its ACK-pending recipient with Postfix."""
-    request = endpoint.requests.get(timeout=15)
+def decode_ses_request(request: Request, sender: str, recipient: str) -> bytes:
+    """Validate the SES request envelope and return the raw submitted message."""
     assert request.path == "/v2/email/outbound-emails", request.path
     assert request.content_type == "application/json", request.content_type
     assert re.fullmatch(r"AWS4-HMAC-SHA256 Credential=TESTKEY/\d{8}/us-east-1/ses/aws4_request, ?"
@@ -136,7 +144,13 @@ def receive_attempt(endpoint: Endpoint, sender: str, recipient: str) -> tuple[Re
     payload = json.loads(request.body)
     assert payload["FromEmailAddress"] == sender, payload
     assert payload["Destination"] == {"ToAddresses": [recipient]}, payload
-    raw = base64.b64decode(payload["Content"]["Raw"]["Data"], validate=True)
+    return base64.b64decode(payload["Content"]["Raw"]["Data"], validate=True)
+
+
+def receive_attempt(endpoint: Endpoint, sender: str, recipient: str) -> tuple[Request, bytes, str]:
+    """Wait for a full SES request and correlate its ACK-pending recipient with Postfix."""
+    request = endpoint.requests.get(timeout=15)
+    raw = decode_ses_request(request, sender, recipient)
 
     # The endpoint has the full request but has not acknowledged acceptance.
     entries = queue_entries()
@@ -146,6 +160,27 @@ def receive_attempt(endpoint: Endpoint, sender: str, recipient: str) -> tuple[Re
     assert [r["address"] for r in entry["recipients"]] == [recipient], entry
     queue_id = entry["queue_id"]
     return request, raw, queue_id
+
+
+def wait_for_removal(message_id: str) -> str:
+    """Wait for the submitted message and any reinjected mail to leave the queue.
+
+    Args:
+        message_id: Unique Message-ID header value without angle brackets.
+
+    Returns:
+        The original queue ID, even when forwarding reuses the same Message-ID.
+    """
+    cleanup = re.compile(r"postfix/cleanup\[\d+\]: ([A-Za-z0-9]+): message-id=<"
+                         + re.escape(message_id) + ">")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        logs = MAIL_LOG.read_text()
+        first = cleanup.search(logs)
+        if first and f"{first[1]}: removed" in logs and not queue_entries():
+            return first[1]
+        time.sleep(0.1)
+    raise AssertionError(f"queue did not drain after Message-ID <{message_id}>")
 
 
 def verify_completed(queue_id: str, recipient: str) -> str:

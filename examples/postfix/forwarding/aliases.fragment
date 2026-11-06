@@ -1,0 +1,4 @@
+# Merge into the aliases database used by local(8), then run newaliases.
+# Replace the target and monitored local bounce mailbox with site values.
+redirect: recipient@outside.test
+owner-redirect: forward-bounces

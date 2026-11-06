@@ -43,7 +43,7 @@ jobs:
           fi
       - run: go vet ./...
       - run: go test ./...
-      - name: Verify SES handoff, failures and recovery with a real Postfix queue
+      - name: Verify Postfix routing, SES handoff and queue recovery
         run: bash tests/postfix/test.sh
       - name: Build and smoke-test release archive
         run: bash scripts/package.sh "$VERSION" dist
