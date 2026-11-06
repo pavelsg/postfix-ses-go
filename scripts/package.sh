@@ -43,25 +43,33 @@ if [[ $actual_version != "$binary $version" ]]; then
     exit 1
 fi
 
-# Exercise the Postfix argument contract in the packaged build.
+# An empty required region exercises deferral without using host credentials.
 delivery_status=0
 diagnostic=$(printf 'From: sender@example.test\r\n\r\nfixture\r\n' |
-    "$stage/$binary" sender@example.test recipient@example.test ABC123 2>&1) || delivery_status=$?
+    AWS_REGION= "$stage/$binary" sender@example.test recipient@example.test ABC123 2>&1) || delivery_status=$?
 if [[ $delivery_status -ne 75 ]]; then
     echo "Expected a temporary delivery failure (75), got $delivery_status." >&2
     exit 1
 fi
-if [[ $diagnostic != '4.3.0 postfix-ses-go: delivery is not implemented' ]]; then
+if [[ $diagnostic != '4.3.0 postfix-ses-go: SES configuration unavailable' ]]; then
     echo "Unexpected delivery diagnostic from release binary." >&2
     exit 1
 fi
 
-install -m 0644 LICENSE README.md "$stage/"
+install -m 0644 LICENSE README.md .env.example "$stage/"
+install -d "$stage/licenses"
+aws_sdk=$(go list -m -f '{{.Dir}}' github.com/aws/aws-sdk-go-v2)
+smithy=$(go list -m -f '{{.Dir}}' github.com/aws/smithy-go)
+install -m 0644 "$aws_sdk/LICENSE.txt" "$stage/licenses/aws-sdk-go-v2-LICENSE"
+install -m 0644 "$aws_sdk/NOTICE.txt" "$stage/licenses/aws-sdk-go-v2-NOTICE"
+install -m 0644 "$smithy/LICENSE" "$stage/licenses/smithy-go-LICENSE"
+install -m 0644 "$smithy/NOTICE" "$stage/licenses/smithy-go-NOTICE"
+install -m 0644 "$(go env GOROOT)/LICENSE" "$stage/licenses/go-LICENSE"
 install -d "$stage/examples/postfix"
 install -m 0644 examples/postfix/{main.cf.fragment,master.cf.fragment,ses_senders} "$stage/examples/postfix/"
 archive="${binary}_${version}_linux_${arch}.tar.gz"
 # Normalize ownership and timestamps so runner metadata stays out of releases.
 tar -C "$stage" --format=ustar --owner=0 --group=0 --mtime=@0 \
-    --sort=name -cf - "$binary" LICENSE README.md examples | gzip -n > "$stage/$archive"
+    --sort=name -cf - "$binary" LICENSE README.md .env.example examples licenses | gzip -n > "$stage/$archive"
 mv -- "$stage/$archive" "$out_dir/$archive"
 printf '%s\n' "$out_dir/$archive"
