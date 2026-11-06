@@ -13,6 +13,8 @@ postfix-ses-go ENVELOPE_SENDER ENVELOPE_RECIPIENT QUEUE_ID < message.eml
 
 `--version` as the only argument prints the build version and exits 0. Delivery takes exactly three positional arguments. Pass the envelope sender even when it is empty (the null reverse path), one nonempty envelope recipient, and the Postfix queue ID as ASCII letters and digits. Envelope addresses are opaque arguments and must be free of control characters. The visible From, To and Cc headers belong to the message.
 
+The reference pipe uses Postfix’s unquoted envelope address form (the `q` flag is omitted). For example, the queue and logs show `"a b"@outside.test`, and the executable receives `a b@outside.test` as a single argument with the space preserved. For a message addressed to two recipients on the same external domain, Postfix invokes the executable twice with the same queue ID and a different recipient argument each time.
+
 Postfix writes the queued headers and body to stdin with CRLF line endings and closes the pipe at the end of the message. The current implementation reads and discards up to 10 MiB, probing one more byte to detect an oversized input. The reference transport sets a 30-second Postfix process time limit. These are initial implementation choices. A later SES request deadline must fit inside the transport limit.
 
 | Phase 1 invocation | Exit | Output |
