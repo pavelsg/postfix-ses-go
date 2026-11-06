@@ -37,7 +37,9 @@ The send uses the AWS SDK for Go v2 with automatic send retries disabled. A 20-s
 
 ### Configure the pipe environment
 
-Set `AWS_REGION` explicitly to the region of a verified sending identity. Supply an AWS runtime identity with permission for `ses:SendEmail` through the SDK credential chain. Ensure the dedicated pipe user can access the identity and the system CA bundle. The executable reads its process environment. The repository’s `.env.example` lists settings.
+Grant the pipe's IAM user or role `ses:SendRawEmail` on the verified SES sending identity. The agent calls the SES v2 `SendEmail` API with `Content.Raw` to forward the MIME message from Postfix. SES uses the raw-send IAM action for that content type. [AWS explanation of how SES authorizes sends](https://aws.amazon.com/blogs/contact-center/amazon-ses-features-for-protective-markings/#:~:text=SES%20authorizes%20each%20send%20by%20its%20content%20type)
+
+Set `AWS_REGION` explicitly to the region of the verified sending identity. Ensure the dedicated pipe user can resolve its AWS credentials through the SDK credential chain and read the system CA bundle. The executable reads its process environment. The repository’s `.env.example` lists settings.
 
 Postfix filters the environment it passes to external commands. For example, to set a public region for this transport, add the following override immediately below the `pipe` service line in the supplied `master.cf` fragment, before `user=sespipe`. This long-form override requires Postfix 3.0 or newer. If using a shared credentials file, include `AWS_SHARED_CREDENTIALS_FILE=/etc/postfix/ses-credentials` in the same list and restrict file access to the pipe identity and administrators.
 
@@ -148,7 +150,7 @@ The same-directory rename activates the binary for the next pipe invocation. A r
 
 ### Opt-in live SES smoke test
 
-Use the verified Linux binary, Python 3.9 or newer, a send-only AWS identity, a verified sender in the chosen region, and a mailbox you control. Configure the SES sending identity's default configuration set to publish Delivery events to a destination you can inspect. The send and evidence-verification steps are separate. The [SES event format](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html) describes the message ID assigned at acceptance and the recipients confirmed by the remote mail server.
+Use the verified Linux binary, Python 3.9 or newer, a verified sender in the chosen region, and a mailbox you control. Use a send-only IAM identity with the same `ses:SendRawEmail` permission as the pipe. Configure the SES sending identity's default configuration set to publish Delivery events to a destination you can inspect. The send and evidence-verification steps are separate. The [SES event format](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html) describes the message ID assigned at acceptance and the recipients confirmed by the remote mail server.
 
 From the extracted package directory, substitute your own region and plain ASCII sender and recipient addresses. Leave the custom SES endpoint unset. The following command invokes the packaged binary directly with a unique smoke marker as its queue ID. It sends **one real message** and saves the acceptance receipt:
 
