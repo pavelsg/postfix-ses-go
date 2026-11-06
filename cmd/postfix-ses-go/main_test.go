@@ -21,36 +21,39 @@ func TestRun(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		args       []string
+		code       int
 		diagnostic string
 	}{
-		{"version", []string{"--version"}, ""},
-		{"no arguments", nil, "invalid pipe arguments"},
-		{"unknown flag", []string{"--help"}, "invalid pipe arguments"},
-		{"version with extra argument", []string{"--version", "private"}, "invalid pipe arguments"},
-		{"extra recipient", []string{"sender", "rcpt1", "rcpt2", "123AB"}, "invalid pipe arguments"},
-		{"empty recipient", []string{"sender", "", "123AB"}, "invalid pipe arguments"},
-		{"empty queue ID", []string{"sender", "rcpt", ""}, "invalid pipe arguments"},
-		{"unsafe queue ID", []string{"sender", "rcpt", "123\nAB"}, "invalid pipe arguments"},
-		{"non-ASCII queue ID", []string{"sender", "rcpt", "12É"}, "invalid pipe arguments"},
-		{"sender control", []string{"send\rer", "rcpt", "123AB"}, "invalid pipe arguments"},
-		{"recipient control", []string{"sender", "rcpt\u0085", "123AB"}, "invalid pipe arguments"},
-		{"null sender", []string{"", "rcpt", "4zD5Vj3fK8z"}, "null sender is not eligible for SES"},
-		{"opaque mailbox", []string{`"a b"@example.org`, "-alias+tag@example.org", "ABC12"}, "invalid message headers"},
-		{"version as recipient", []string{"sender", "--version", "123AB"}, "invalid message headers"},
+		{"version", []string{"--version"}, 0, ""},
+		{"no arguments", nil, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"unknown flag", []string{"--help"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"version with extra argument", []string{"--version", "private"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"extra recipient", []string{"sender", "rcpt1", "rcpt2", "123AB"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"empty recipient", []string{"sender", "", "123AB"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"empty queue ID", []string{"sender", "rcpt", ""}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"unsafe queue ID", []string{"sender", "rcpt", "123\nAB"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"non-ASCII queue ID", []string{"sender", "rcpt", "12É"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"sender control", []string{"send\rer", "rcpt", "123AB"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"recipient control", []string{"sender", "rcpt\u0085", "123AB"}, 75, "4.3.0 postfix-ses-go: invalid pipe arguments"},
+		{"null sender", []string{"", "rcpt", "4zD5Vj3fK8z"}, 75, "4.3.0 postfix-ses-go: null sender is not eligible for SES"},
+		{"opaque mailbox", []string{`"a b"@example.org`, "-alias+tag@example.org", "ABC12"}, 65, "5.6.0 postfix-ses-go: invalid message headers"},
+		{"version as recipient", []string{"sender", "--version", "123AB"}, 65, "5.6.0 postfix-ses-go: invalid message headers"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			input := strings.NewReader("Subject: private\r\n\r\nSensitive body\r\n")
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, input, &stdout, &stderr, nil)
-			if tc.diagnostic == "" {
-				if code != 0 || stdout.String() != "postfix-ses-go dev\n" || stderr.Len() != 0 {
-					t.Errorf("version: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
-				}
-			} else if code != 75 || stdout.Len() != 0 || stderr.String() != "4.3.0 postfix-ses-go: "+tc.diagnostic+"\n" {
-				t.Errorf("delivery: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+			wantStdout, wantStderr := "", tc.diagnostic
+			if tc.code == 0 {
+				wantStdout = "postfix-ses-go dev\n"
+			} else {
+				wantStderr += "\n"
+			}
+			if code != tc.code || stdout.String() != wantStdout || stderr.String() != wantStderr {
+				t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 			}
 			wantRemaining := int(input.Size())
-			if tc.diagnostic == "invalid message headers" {
+			if tc.code == 65 {
 				wantRemaining = 0
 			}
 			if input.Len() != wantRemaining {
@@ -69,14 +72,17 @@ func TestHandoff(t *testing.T) {
 		name       string
 		id         string
 		err        error
+		code       int
 		diagnostic string
 	}{
-		{"accepted", "SES-123", nil, ""},
-		{"missing ID", "", nil, "SES acceptance uncertain queue_id=ABC123"},
-		{"uncertain", "", sestransport.ErrUncertain, "SES acceptance uncertain queue_id=ABC123"},
-		{"invalid address", "", sestransport.ErrAddress, "unsupported envelope address"},
-		{"configuration", "", sestransport.ErrConfiguration, "SES configuration unavailable"},
-		{"other failure", "", errors.New("private detail"), "SES submission failed"},
+		{"accepted", "SES-123", nil, 0, ""},
+		{"missing ID", "", nil, 75, "4.3.0 postfix-ses-go: SES acceptance uncertain queue_id=ABC123"},
+		{"uncertain", "", sestransport.ErrUncertain, 75, "4.3.0 postfix-ses-go: SES acceptance uncertain queue_id=ABC123"},
+		{"invalid address", "", sestransport.ErrAddress, 75, "4.3.0 postfix-ses-go: unsupported envelope address"},
+		{"configuration", "", sestransport.ErrConfiguration, 75, "4.3.0 postfix-ses-go: SES configuration unavailable"},
+		{"throttle", "", sestransport.ErrThrottled, 75, "4.3.0 postfix-ses-go: SES throttled request"},
+		{"message content", "", sestransport.ErrMessage, 65, "5.6.0 postfix-ses-go: SES rejected message content"},
+		{"other failure", "", errors.New("private detail"), 75, "4.3.0 postfix-ses-go: SES submission failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -100,8 +106,8 @@ func TestHandoff(t *testing.T) {
 				if code != 0 || stdout.String() != "postfix-ses-go: queue_id=ABC123 ses_message_id=SES-123\n" || stderr.Len() != 0 {
 					t.Fatalf("unexpected success result: %d %q %q", code, stdout.String(), stderr.String())
 				}
-			} else if code != 75 || stdout.Len() != 0 || stderr.String() != "4.3.0 postfix-ses-go: "+tc.diagnostic+"\n" {
-				t.Fatalf("unexpected deferral: %d %q %q", code, stdout.String(), stderr.String())
+			} else if code != tc.code || stdout.Len() != 0 || stderr.String() != tc.diagnostic+"\n" {
+				t.Fatalf("unexpected failure outcome: %d %q %q", code, stdout.String(), stderr.String())
 			}
 		})
 	}
@@ -116,11 +122,12 @@ func TestBoundedInput(t *testing.T) {
 	for _, tc := range []struct {
 		size       int
 		remaining  int
+		code       int
 		diagnostic string
 	}{
-		{limit, 0, "SES configuration unavailable"},
-		{limit + 1, 0, "message exceeds 10 MiB"},
-		{limit + 2, 1, "message exceeds 10 MiB"},
+		{limit, 0, 75, "4.3.0 postfix-ses-go: SES configuration unavailable"},
+		{limit + 1, 0, 65, "5.3.4 postfix-ses-go: message exceeds 10 MiB"},
+		{limit + 2, 1, 65, "5.3.4 postfix-ses-go: message exceeds 10 MiB"},
 	} {
 		input := bytes.NewReader(payload[:tc.size])
 		var stderr bytes.Buffer
@@ -128,7 +135,7 @@ func TestBoundedInput(t *testing.T) {
 			return "", sestransport.ErrConfiguration
 		})
 		got := stderr.String()
-		if code != 75 || got != "4.3.0 postfix-ses-go: "+tc.diagnostic+"\n" || input.Len() != tc.remaining {
+		if code != tc.code || got != tc.diagnostic+"\n" || input.Len() != tc.remaining {
 			t.Errorf("size %d: diagnostic %q, remaining bytes %d", tc.size, got, input.Len())
 		}
 	}
@@ -138,6 +145,15 @@ func TestBoundedInput(t *testing.T) {
 	code := run([]string{"sender", "rcpt", "123AB"}, broken, &stdout, &stderr, nil)
 	if code != 75 || stdout.Len() != 0 || stderr.String() != "4.3.0 postfix-ses-go: cannot read message\n" {
 		t.Fatalf("read error: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+// TestPipeFraming defers an LF-only pipe configuration that could affect all mail.
+func TestPipeFraming(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"sender", "rcpt", "123AB"}, strings.NewReader("From: a@b.test\n\nbody"), io.Discard, &stderr, nil)
+	if code != 75 || stderr.String() != "4.3.0 postfix-ses-go: invalid pipe message framing\n" {
+		t.Fatalf("pipe framing: exit %d, stderr %q", code, stderr.String())
 	}
 }
 

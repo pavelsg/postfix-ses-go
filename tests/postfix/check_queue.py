@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from ses_endpoint import Endpoint, MESSAGE_ID, controlled_endpoint
+from ses_endpoint import Endpoint, MESSAGE_ID, Request, controlled_endpoint
 
 CONFIG = Path("/opt/test/config")
 POSTFIX = Path("/etc/postfix")
@@ -21,13 +21,17 @@ NULL_ERROR = "4.3.0 postfix-ses-go: null sender is not eligible for SES"
 BODY = b"\r\n\r\nfirst line\r\n.dot-prefixed line\r\nlast line\r\n"
 
 
-def configure(*, handoff: bool) -> None:
+def configure(*, handoff: bool, hold_bounces: bool = False) -> None:
     """Apply the operator examples and route just the null-sender probe by recipient."""
     for name in ("main.cf", "master.cf"):
         with (POSTFIX / name).open("ab") as dest:
             dest.write(b"\n" + (CONFIG / (name + ".fragment")).read_bytes())
     shutil.copyfile(CONFIG / "ses_senders", POSTFIX / "ses_senders")
-    (POSTFIX / "probe_routes").write_text("null-probe@example.test sespipe:\n")
+    routes = "null-probe@example.test sespipe:\n"
+    if hold_bounces:
+        # Retain the generated DSN for inspection instead of sending test mail.
+        routes += "sender@example.test retry:4.3.0 hold fixture DSN\n"
+    (POSTFIX / "probe_routes").write_text(routes)
     subprocess.run(["postmap", str(POSTFIX / "probe_routes")], check=True)
     subprocess.run([
         "postconf", "-e",
@@ -115,6 +119,53 @@ def verify_result(directory: Path, observed: dict, diagnostic: str) -> None:
     assert b"From: Visible Author <author@example.test>\r\n" in wire, wire
 
 
+def queue_entries() -> dict[str, dict]:
+    """Read the real queue and index its messages by Postfix queue ID."""
+    listing = subprocess.check_output(["postqueue", "-j"], text=True)
+    entries = map(json.loads, listing.splitlines())
+    return {entry["queue_id"]: entry for entry in entries}
+
+
+def receive_attempt(endpoint: Endpoint, sender: str, recipient: str) -> tuple[Request, bytes, str]:
+    """Wait for a full SES request and correlate its ACK-pending recipient with Postfix."""
+    request = endpoint.requests.get(timeout=15)
+    assert request.path == "/v2/email/outbound-emails", request.path
+    assert request.content_type == "application/json", request.content_type
+    assert re.fullmatch(r"AWS4-HMAC-SHA256 Credential=TESTKEY/\d{8}/us-east-1/ses/aws4_request, ?"
+                        r"SignedHeaders=[^,]+, ?Signature=[0-9a-f]{64}", request.authorization)
+    payload = json.loads(request.body)
+    assert payload["FromEmailAddress"] == sender, payload
+    assert payload["Destination"] == {"ToAddresses": [recipient]}, payload
+    raw = base64.b64decode(payload["Content"]["Raw"]["Data"], validate=True)
+
+    # The endpoint has the full request but has not acknowledged acceptance.
+    entries = queue_entries()
+    assert len(entries) == 1, entries
+    entry = next(iter(entries.values()))
+    assert entry["queue_name"] == "active" and entry["sender"] == sender, entry
+    assert [r["address"] for r in entry["recipients"]] == [recipient], entry
+    queue_id = entry["queue_id"]
+    return request, raw, queue_id
+
+
+def verify_completed(queue_id: str, recipient: str) -> str:
+    """Wait for the accepted recipient and queue removal; return its success diagnostic."""
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        logs = MAIL_LOG.read_text().splitlines()
+        if (any(f"{queue_id}: removed" in line for line in logs)
+                and not queue_entries()):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError(f"{queue_id} was not removed after the SES acknowledgement")
+
+    accepted = f"postfix-ses-go: queue_id={queue_id} ses_message_id={MESSAGE_ID}"
+    assert any(f"{queue_id}: to=<{recipient}>, relay=sespipe," in line
+               and "status=sent" in line and accepted in line for line in logs), logs
+    return accepted
+
+
 def verify_handoff(endpoint: Endpoint) -> None:
     """Match one blind-copy delivery across the pipe, signed SES request and queue."""
     sender = "sender@example.test"
@@ -133,38 +184,9 @@ def verify_handoff(endpoint: Endpoint) -> None:
     subprocess.run(["sendmail", "-i", "-f", sender, "--", recipient], check=True,
                    input=(visible + private + content).replace(b"\r\n", b"\n"))
 
-    request = endpoint.requests.get(timeout=15)
-    assert request.path == "/v2/email/outbound-emails", request.path
-    assert request.content_type == "application/json", request.content_type
-    assert re.fullmatch(r"AWS4-HMAC-SHA256 Credential=TESTKEY/\d{8}/us-east-1/ses/aws4_request, ?"
-                        r"SignedHeaders=[^,]+, ?Signature=[0-9a-f]{64}", request.authorization)
-    payload = json.loads(request.body)
-    assert payload["FromEmailAddress"] == sender, payload
-    assert payload["Destination"] == {"ToAddresses": [recipient]}, payload
-    raw = base64.b64decode(payload["Content"]["Raw"]["Data"], validate=True)
-
-    # The endpoint has the full request but has not acknowledged acceptance.
-    listing = subprocess.check_output(["postqueue", "-j"], text=True).splitlines()
-    assert len(listing) == 1, listing
-    entry = json.loads(listing[0])
-    assert entry["queue_name"] == "active" and entry["sender"] == sender, entry
-    assert [r["address"] for r in entry["recipients"]] == [recipient], entry
-    queue_id = entry["queue_id"]
-    endpoint.acknowledge.set()
-
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        logs = MAIL_LOG.read_text().splitlines()
-        if (any(f"{queue_id}: removed" in line for line in logs)
-                and not subprocess.check_output(["postqueue", "-j"]).strip()):
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError(f"{queue_id} was not removed after the SES acknowledgement")
-
-    accepted = f"postfix-ses-go: queue_id={queue_id} ses_message_id={MESSAGE_ID}"
-    assert any(f"{queue_id}: to=<{recipient}>, relay=sespipe," in line
-               and "status=sent" in line and accepted in line for line in logs), logs
+    request, raw, queue_id = receive_attempt(endpoint, sender, recipient)
+    request.accept()
+    accepted = verify_completed(queue_id, recipient)
     records = list(CAPTURES.glob("*/record.json"))
     assert len(records) == 1, records
     observed = json.loads(records[0].read_text())

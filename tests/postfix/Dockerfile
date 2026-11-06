@@ -7,6 +7,6 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin sespipe
 
 COPY capture.py /usr/local/libexec/postfix-ses-go
-COPY check_queue.py ses_endpoint.py /opt/test/
+COPY check_queue.py failure_queue.py ses_endpoint.py /opt/test/
 RUN chmod 0755 /usr/local/libexec/postfix-ses-go
-ENTRYPOINT ["timeout", "--kill-after=5s", "90s", "python3", "-u", "/opt/test/check_queue.py"]
+ENTRYPOINT ["timeout", "--kill-after=5s", "90s", "python3", "-u"]

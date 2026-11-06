@@ -21,13 +21,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/smithy-go/logging"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // These errors are safe to map to diagnostics visible to Postfix and senders.
 var (
 	ErrConfiguration = errors.New("invalid SES configuration or credentials")
 	ErrAddress       = errors.New("unsupported envelope address")
+	ErrThrottled     = errors.New("SES throttled the send")
+	ErrMessage       = errors.New("SES rejected message content")
 	ErrTemporary     = errors.New("SES handoff deferred")
 	ErrUncertain     = errors.New("SES acceptance uncertain")
 )
@@ -58,6 +59,9 @@ func Send(ctx context.Context, sender, recipient string, raw []byte) (string, er
 	}
 	client, err := newClient(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ErrTemporary
+		}
 		return "", err
 	}
 	// A transport failure before any request headers were written cannot have
@@ -70,14 +74,7 @@ func Send(ctx context.Context, sender, recipient string, raw []byte) (string, er
 		Content:          &types.EmailContent{Raw: &types.RawMessage{Data: raw}},
 	})
 	if err != nil {
-		var response *smithyhttp.ResponseError
-		if errors.As(err, &response) && response.HTTPStatusCode() >= 300 && response.HTTPStatusCode() < 500 {
-			return "", ErrTemporary
-		}
-		if wroteHeaders.Load() {
-			return "", ErrUncertain
-		}
-		return "", ErrTemporary
+		return "", classifySendError(err, wroteHeaders.Load(), raw)
 	}
 	id := aws.ToString(out.MessageId)
 	if !messageID.MatchString(id) {

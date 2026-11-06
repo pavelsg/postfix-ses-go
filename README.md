@@ -2,7 +2,7 @@
 
 A Go delivery agent under development for Postfix operators who want to route selected outbound mail through the Amazon SES v2 HTTPS API. Postfix chooses the route and owns the queue. The agent submits one envelope recipient per invocation. The [project goals](https://github.com/pavelsg/postfix-ses-go/blob/HEAD/GOAL.md) describe routing, failure handling, and release acceptance criteria.
 
-**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Its handoff is tested against a controlled endpoint. Permanent-failure classification, the full routing suite, and live SES qualification are pending. Test installations with real AWS credentials and an opted-in sender can send real mail.
+**Development status.** The binary submits raw mail through the SES v2 HTTPS API. Real Postfix queue tests cover handoff, deferral, bounces, and recovery against a controlled endpoint. The full routing suite and live SES qualification are pending. Test installations with real AWS credentials and an opted-in sender can send real mail.
 
 ## Postfix pipe contract
 
@@ -24,9 +24,16 @@ The signed SES request uses the envelope sender as `FromEmailAddress` and the si
 | Standalone version query | 0 | Print the version |
 | SES returns a usable message ID | 0 | Complete this recipient's handoff. The binary writes the queue ID and SES message ID together on stdout. |
 | Timeout or lost response after transmission, or unusable acknowledgement | 75 | Defer with an uncertain-acceptance diagnostic and queue ID. A later attempt can duplicate a message SES already accepted. |
-| Invalid invocation, oversized or malformed message, configuration problem, or rejected request | 75 | Defer with a concise diagnostic. All failures currently remain retryable. |
+| SES throttling, temporary network failure, unverified identity, unavailable credentials, or an unrecognized rejection | 75 | Defer with a `4.3.0` diagnostic. Fix deployment problems before retrying. |
+| Invalid pipe arguments, unsupported envelope, stdin read failure, or uncertain header framing | 75 | Defer. Check the pipe configuration and CRLF delimiter. |
+| Message exceeds the 10 MiB input limit | 65 | Report a permanent size failure (`5.3.4`) for this recipient, before any send request. |
+| Definitive message content error | 65 | Report a permanent content failure (`5.6.0`) for this recipient. Postfix handles the delivery status notification. |
 
-The send uses the AWS SDK for Go v2 with automatic send retries disabled. A 20-second application deadline starts before reading stdin and covers credential lookup and HTTPS submission. Postfix enforces a separate 30-second process limit, including a stalled stdin. Postfix owns subsequent attempts. SES acceptance ends the local handoff. Final delivery and later bounces are handled by SES. The tested Postfix 3.7.11 logs the IDs from stdout on success. Logging successful pipe output requires Postfix 3.0 or newer. Postfix can include command output in delivery status notifications, so diagnostics omit addresses, message contents, and credential details.
+**When the binary bounces a message.** Local checks catch malformed header fields and a missing, empty or repeated From field in CRLF-framed input. For an SES rejection, the binary requires a recognized HTTP 400 input error, an explicit duplicate-header reason, and two occurrences of that field in the submitted outer headers. The recognized fields are Subject, Date, Message-ID, MIME-Version, Content-Type and Content-Transfer-Encoding. For example, two Subject fields plus an SES duplicate-Subject rejection qualify. An unverified identity can also produce HTTP 400 `MessageRejected` and stays queued for the operator. An unfamiliar reason also stays queued. AWS documents the possible causes in its [sending errors guide](https://docs.aws.amazon.com/ses/latest/dg/troubleshoot-error-messages.html).
+
+**Upgrading from phase 2.** The command arguments and stdin contract are the same. Messages that exceed the documented size limit or meet the permanent-error criteria now bounce. Check the mail host’s size policy and the pipe’s CRLF configuration before installing the new binary.
+
+The send uses the AWS SDK for Go v2 with automatic send retries disabled. A 20-second application deadline starts before reading stdin and covers credential lookup and HTTPS submission. Postfix enforces a separate 30-second process limit, including a stalled stdin. Postfix owns subsequent attempts. For an uncertain handoff, use the queue ID to investigate before forcing a retry. A retry after a restart can send a second copy if SES accepted the first request. SES acceptance ends the local handoff. Final delivery and later bounces are handled by SES. The tested Postfix 3.7.11 logs the IDs from stdout on success. Logging successful pipe output requires Postfix 3.0 or newer. Postfix can include command output in delivery status notifications, so diagnostics omit addresses, message contents, and credential details.
 
 ### Configure the pipe environment
 
@@ -60,7 +67,7 @@ go build -o bin/postfix-ses-go ./cmd/postfix-ses-go
 ./bin/postfix-ses-go --version
 ```
 
-With Docker available, run `bash tests/postfix/test.sh` to exercise the real Postfix queue in a disposable container. The reference configuration has been exercised on Debian 12 with Postfix 3.7.11. The test holds the HTTPS acknowledgement until it observes the active recipient, inspects the signed raw request, and then checks the SES ID, successful pipe exit and queue removal. The container runs with external networking disabled and uses disposable test credentials.
+With Docker available, run `bash tests/postfix/test.sh` to exercise the real Postfix queue in a disposable container. The reference configuration has been exercised on Debian 12 with Postfix 3.7.11. The suite checks request counts, pipe exits, per-recipient queue state and Postfix diagnostics. It exercises acceptance, throttling, recoverable and permanent HTTP 400 responses, a lost acknowledgement, and an interrupted pipe. Recovery tests let Postfix schedule a later delivery of the same queue ID. Containers run with external networking disabled and use disposable test credentials.
 
 ## Release workflow
 

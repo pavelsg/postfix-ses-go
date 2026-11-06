@@ -11,11 +11,17 @@ arch=$(docker image inspect "$image" --format '{{.Architecture}}')
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$work/postfix-ses-go" ./cmd/postfix-ses-go
 cp -R examples/postfix "$work/config"
 
-# Separate queues keep the missing-region regression independent of the fake
-# credentials and local trust root used for the successful send.
-for scenario in defer handoff; do
+# Each fault gets an isolated queue and a peer with an independent request count.
+if [[ $# -eq 0 ]]; then
+    set -- defer handoff throttle configuration permanent unknown lost-ack interrupted local-content
+fi
+for scenario in "$@"; do
+    case "$scenario" in
+        defer|handoff) driver=check_queue.py ;;
+        *) driver=failure_queue.py ;;
+    esac
     docker run --rm --network none --hostname mx.example.test \
         --mount "type=bind,src=$work/postfix-ses-go,dst=/usr/local/libexec/postfix-ses-go.real,readonly" \
         --mount "type=bind,src=$work/config,dst=/opt/test/config,readonly" \
-        "$image" "$scenario"
+        "$image" "/opt/test/$driver" "$scenario"
 done
