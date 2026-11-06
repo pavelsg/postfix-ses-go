@@ -43,18 +43,25 @@ if [[ $actual_version != "$binary $version" ]]; then
     exit 1
 fi
 
-# While delivery is scaffolded, a pipe invocation must defer the queued message.
+# Exercise the Postfix argument contract in the packaged build.
 delivery_status=0
-"$stage/$binary" </dev/null >/dev/null 2>&1 || delivery_status=$?
+diagnostic=$(printf 'From: sender@example.test\r\n\r\nfixture\r\n' |
+    "$stage/$binary" sender@example.test recipient@example.test ABC123 2>&1) || delivery_status=$?
 if [[ $delivery_status -ne 75 ]]; then
     echo "Expected a temporary delivery failure (75), got $delivery_status." >&2
     exit 1
 fi
+if [[ $diagnostic != '4.3.0 postfix-ses-go: delivery is not implemented' ]]; then
+    echo "Unexpected delivery diagnostic from release binary." >&2
+    exit 1
+fi
 
 install -m 0644 LICENSE README.md "$stage/"
+install -d "$stage/examples/postfix"
+install -m 0644 examples/postfix/{main.cf.fragment,master.cf.fragment,ses_senders} "$stage/examples/postfix/"
 archive="${binary}_${version}_linux_${arch}.tar.gz"
 # Normalize ownership and timestamps so runner metadata stays out of releases.
 tar -C "$stage" --format=ustar --owner=0 --group=0 --mtime=@0 \
-    -cf - "$binary" LICENSE README.md | gzip -n > "$stage/$archive"
+    --sort=name -cf - "$binary" LICENSE README.md examples | gzip -n > "$stage/$archive"
 mv -- "$stage/$archive" "$out_dir/$archive"
 printf '%s\n' "$out_dir/$archive"

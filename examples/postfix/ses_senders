@@ -1,0 +1,2 @@
+# Each mailbox or alias opts in independently by its envelope sender address.
+/^sender@example[.]test$/    sespipe:
