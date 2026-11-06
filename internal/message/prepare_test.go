@@ -51,26 +51,27 @@ func TestPrepareRejectsAmbiguousHeaders(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
+		want error
 	}{
-		{"empty", ""},
-		{"missing separator", from + "Bcc: secret@example.test\r\n"},
-		{"missing author", "To: visible@example.test\r\n\r\n"},
-		{"empty author", "From: \t\r\n \t\r\n\r\n"},
-		{"repeated author", from + "fROM: b@example.test\r\n\r\n"},
-		{"pseudo author in body", "Subject: example\r\n\r\n" + from},
-		{"orphan continuation", " Subject: example\r\n" + from + "\r\n"},
-		{"no colon", from + "bcc hidden@example.test\r\n\r\n"},
-		{"space in name", from + "Bcc : secret@example.test\r\n\r\n"},
-		{"empty name", from + ": value\r\n\r\n"},
-		{"non-ASCII name", from + "Bçc: hidden@example.test\r\n\r\n"},
-		{"bare LF", from + "Subject: safe\nBcc: secret@example.test\r\n\r\n"},
-		{"bare CR in fold", from + " \rBcc: hidden@example.test\r\n\r\n"},
-		{"NUL in value", from + "Subject: \x00\r\n\r\n"},
-		{"control in dropped field", from + "Bcc: secret\x7f@example.test\r\n\r\n"},
+		{"empty", "", errPipeFormat},
+		{"missing separator", from + "Bcc: secret@example.test\r\n", errPipeFormat},
+		{"missing author", "To: visible@example.test\r\n\r\n", ErrInvalidHeaders},
+		{"empty author", "From: \t\r\n \t\r\n\r\n", ErrInvalidHeaders},
+		{"repeated author", from + "fROM: b@example.test\r\n\r\n", ErrInvalidHeaders},
+		{"pseudo author in body", "Subject: example\r\n\r\n" + from, ErrInvalidHeaders},
+		{"orphan continuation", " Subject: example\r\n" + from + "\r\n", ErrInvalidHeaders},
+		{"no colon", from + "bcc hidden@example.test\r\n\r\n", ErrInvalidHeaders},
+		{"space in name", from + "Bcc : secret@example.test\r\n\r\n", ErrInvalidHeaders},
+		{"empty name", from + ": value\r\n\r\n", ErrInvalidHeaders},
+		{"non-ASCII name", from + "Bçc: hidden@example.test\r\n\r\n", ErrInvalidHeaders},
+		{"bare LF", from + "Subject: safe\nBcc: secret@example.test\r\n\r\n", errPipeFormat},
+		{"bare CR in fold", from + " \rBcc: hidden@example.test\r\n\r\n", errPipeFormat},
+		{"NUL in value", from + "Subject: \x00\r\n\r\n", errPipeFormat},
+		{"control in dropped field", from + "Bcc: secret\x7f@example.test\r\n\r\n", errPipeFormat},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, err := Prepare([]byte(tc.raw)); got != nil || err != errHeaders {
-				t.Fatalf("got %q, %v; want no bytes and a generic header error", got, err)
+			if got, err := Prepare([]byte(tc.raw)); got != nil || err != tc.want {
+				t.Fatalf("got %q, %v; want no bytes and %v", got, err, tc.want)
 			}
 		})
 	}

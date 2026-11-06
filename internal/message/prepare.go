@@ -6,7 +6,12 @@ import (
 	"errors"
 )
 
-var errHeaders = errors.New("invalid message headers")
+// ErrInvalidHeaders identifies a structural error in a CRLF-delimited field.
+var ErrInvalidHeaders = errors.New("invalid message headers")
+
+// errPipeFormat indicates input whose framing cannot be trusted. A pipe using
+// its default LF delimiter can cause this error for every message on the host.
+var errPipeFormat = errors.New("invalid pipe message framing")
 
 // Prepare removes top-level blind-copy and SES control fields, including all
 // their continuation lines. Input must have CRLF-delimited headers, exactly
@@ -19,22 +24,22 @@ func Prepare(raw []byte) ([]byte, error) {
 		start := offset
 		line, next, ok := headerLine(raw, offset)
 		if !ok {
-			return nil, errHeaders
+			return nil, errPipeFormat
 		}
 		if len(line) == 0 {
 			if !seenFrom {
-				return nil, errHeaders
+				return nil, ErrInvalidHeaders
 			}
 			return append(prepared, raw[start:]...), nil
 		}
 
 		name, _, found := bytes.Cut(line, []byte(":"))
 		if !found || len(name) == 0 {
-			return nil, errHeaders
+			return nil, ErrInvalidHeaders
 		}
 		for _, c := range name {
 			if c < '!' || c > '~' {
-				return nil, errHeaders
+				return nil, ErrInvalidHeaders
 			}
 		}
 
@@ -44,13 +49,13 @@ func Prepare(raw []byte) ([]byte, error) {
 		for offset < len(raw) && (raw[offset] == ' ' || raw[offset] == '\t') {
 			_, offset, ok = headerLine(raw, offset)
 			if !ok {
-				return nil, errHeaders
+				return nil, errPipeFormat
 			}
 		}
 		if bytes.EqualFold(name, []byte("From")) {
 			value := raw[start+len(name)+1 : offset]
 			if seenFrom || len(bytes.Trim(value, " \t\r\n")) == 0 {
-				return nil, errHeaders
+				return nil, ErrInvalidHeaders
 			}
 			seenFrom = true
 		}

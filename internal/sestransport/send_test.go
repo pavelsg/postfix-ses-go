@@ -106,7 +106,7 @@ func TestNoReplay(t *testing.T) {
 		body   string
 		want   error
 	}{
-		{"throttle", 429, `{"message":"sensitive server text"}`, ErrTemporary},
+		{"throttle", 429, `{"message":"sensitive server text"}`, ErrThrottled},
 		{"server error", 503, `{}`, ErrUncertain},
 		{"redirect", 307, `{}`, ErrTemporary},
 		{"lost response", 0, "", ErrUncertain},
@@ -143,6 +143,82 @@ func TestNoReplay(t *testing.T) {
 				t.Fatalf("Send: id=%q err=%v requests=%d", id, err, requests.Load())
 			}
 		})
+	}
+}
+
+// TestRejectedRequest exercises the actual SDK deserializer against a TLS peer.
+// Every rejected send has a single request and exposes only a safe sentinel.
+func TestRejectedRequest(t *testing.T) {
+	const duplicate = "Duplicate header 'Subject'."
+	const unverified = "Email address is not verified. The following identities failed the check in region US-EAST-1: private@example.org"
+	for _, tc := range []struct {
+		name, code, reason string
+		status             int
+		want               error
+	}{
+		{"confirmed duplicate", "MessageRejected", duplicate, 400, ErrMessage},
+		{"bad input with evidence", "BadRequestException", duplicate, 400, ErrMessage},
+		{"identity", "MessageRejected", unverified, 400, ErrConfiguration},
+		{"sending paused", "SendingPausedException", "", 400, ErrConfiguration},
+		{"unverified domain", "MailFromDomainNotVerifiedException", "", 400, ErrConfiguration},
+		{"IAM denied", "AccessDeniedException", "", 403, ErrConfiguration},
+		{"throttling", "TooManyRequestsException", "", 429, ErrThrottled},
+		{"unfamiliar rejection", "MessageRejected", "unknown reason", 400, ErrTemporary},
+		{"unfamiliar code", "UnfamiliarException", duplicate, 400, ErrTemporary},
+		{"unfamiliar status", "MessageRejected", duplicate, 409, ErrTemporary},
+		{"inconsistent evidence", "MessageRejected", "Duplicate header 'Date'.", 400, ErrTemporary},
+		{"repeatable header", "BadRequestException", "Duplicate header 'Received'.", 400, ErrTemporary},
+		{"reason containing address", "BadRequestException", duplicate + " private@example.org", 400, ErrTemporary},
+		{"server failed after write", "MessageRejected", duplicate, 503, ErrUncertain},
+		{"timeout after write", "RequestTimeout", "", 408, ErrUncertain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configureTest(t)
+			var requests atomic.Int32
+			endpoint(t, func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("X-Amzn-Errortype", tc.code)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if err := json.NewEncoder(w).Encode(map[string]string{"message": tc.reason}); err != nil {
+					t.Error(err)
+				}
+			})
+			const raw = "From: a@example.org\r\nSubject: one\r\nsUbJeCt: two\r\n" +
+				"Received: first\r\nReceived: second\r\nDate: today\r\n\r\nDate: this is body text"
+			id, err := Send(attemptContext(t), "sender@example.org", "rcpt@example.org", []byte(raw))
+			if id != "" || err != tc.want || requests.Load() != 1 {
+				t.Fatalf("Send: id=%q err=%v requests=%d", id, err, requests.Load())
+			}
+		})
+	}
+}
+
+// TestCancelledSend distinguishes expiration before submission from a cancelled
+// wait after the endpoint has received the entire request but has yet to reply.
+func TestCancelledSend(t *testing.T) {
+	for _, afterWrite := range []bool{false, true} {
+		configureTest(t)
+		ctx, cancel := context.WithCancel(attemptContext(t))
+		var requests atomic.Int32
+		endpoint(t, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Error(err)
+			}
+			cancel()
+			<-r.Context().Done()
+		})
+		want, wantRequests := ErrUncertain, int32(1)
+		if !afterWrite {
+			cancel()
+			want, wantRequests = ErrTemporary, 0
+		}
+		id, err := Send(ctx, "sender@example.org", "rcpt@example.org", []byte("raw"))
+		cancel()
+		if id != "" || err != want || requests.Load() != wantRequests {
+			t.Fatalf("afterWrite=%v: id=%q err=%v requests=%d", afterWrite, id, err, requests.Load())
+		}
 	}
 }
 

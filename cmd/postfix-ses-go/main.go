@@ -20,6 +20,7 @@ import (
 var version = "dev"
 
 const (
+	exitDataErr     = 65
 	exitTempFail    = 75
 	maxMessageBytes = 10 << 20
 	// Leave time to return a diagnostic before the reference transport's 30s cutoff.
@@ -62,11 +63,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, send sendEmai
 		return deferDelivery(stderr, "cannot read message")
 	}
 	if len(raw) > maxMessageBytes {
-		return deferDelivery(stderr, "message exceeds 10 MiB")
+		return rejectMessage(stderr, "5.3.4", "message exceeds 10 MiB")
 	}
 	raw, err = message.Prepare(raw)
+	if errors.Is(err, message.ErrInvalidHeaders) {
+		return rejectMessage(stderr, "5.6.0", "invalid message headers")
+	}
 	if err != nil {
-		return deferDelivery(stderr, "invalid message headers")
+		return deferDelivery(stderr, "invalid pipe message framing")
 	}
 
 	id, err := send(ctx, sender, recipient, raw)
@@ -79,6 +83,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, send sendEmai
 		return deferDelivery(stderr, "SES acceptance uncertain queue_id="+queueID)
 	case errors.Is(err, sestransport.ErrConfiguration):
 		return deferDelivery(stderr, "SES configuration unavailable")
+	case errors.Is(err, sestransport.ErrThrottled):
+		return deferDelivery(stderr, "SES throttled request")
+	case errors.Is(err, sestransport.ErrMessage):
+		return rejectMessage(stderr, "5.6.0", "SES rejected message content")
 	case errors.Is(err, sestransport.ErrAddress):
 		return deferDelivery(stderr, "unsupported envelope address")
 	default:
@@ -90,4 +98,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, send sendEmai
 func deferDelivery(stderr io.Writer, diagnostic string) int {
 	fmt.Fprintln(stderr, "4.3.0 postfix-ses-go:", diagnostic)
 	return exitTempFail
+}
+
+// rejectMessage reports a permanent size or content failure to the pipe.
+func rejectMessage(stderr io.Writer, status, diagnostic string) int {
+	fmt.Fprintln(stderr, status, "postfix-ses-go:", diagnostic)
+	return exitDataErr
 }

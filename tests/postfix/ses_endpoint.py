@@ -1,4 +1,4 @@
-"""A loopback-only SES peer whose acknowledgement the queue test can delay."""
+"""A loopback-only SES peer with one test-selected outcome per complete POST."""
 
 import contextlib
 import json
@@ -7,7 +7,7 @@ import queue
 import ssl
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Iterator
@@ -16,22 +16,44 @@ MESSAGE_ID = "ses-test-accepted-001"
 
 
 @dataclass
+class Response:
+    """An SES JSON response and optional Smithy error type."""
+
+    status: int
+    body: dict[str, str]
+    error_code: str = ""
+
+
+@dataclass
 class Request:
-    """The request line, authentication header and exact bytes received over TLS."""
+    """A captured POST awaiting the outcome selected by the queue test."""
 
     path: str
     content_type: str
     authorization: str
     body: bytes
+    response: queue.Queue[Response | None] = field(default_factory=lambda: queue.Queue(maxsize=1),
+                                                   repr=False)
+
+    def accept(self) -> None:
+        """Acknowledge this handoff with the fixture message ID."""
+        self.response.put_nowait(Response(200, {"MessageId": MESSAGE_ID}))
+
+    def reject(self, status: int, code: str, message: str) -> None:
+        """Reject this handoff using an SES HTTP status, error code and message."""
+        self.response.put_nowait(Response(status, {"message": message}, code))
+
+    def drop(self) -> None:
+        """Close the TLS connection after receiving the full POST, before a reply."""
+        self.response.put_nowait(None)
 
 
 class Endpoint(HTTPServer):
-    """Record sends and wait for the test to release the SES acknowledgement."""
+    """Expose complete requests to the queue test on loopback."""
 
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), Handler)
         self.requests: queue.Queue[Request] = queue.Queue()
-        self.acknowledge = threading.Event()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -40,19 +62,31 @@ class Handler(BaseHTTPRequestHandler):
     server: Endpoint
 
     def do_POST(self) -> None:
-        """Record the request before returning the controlled SES message ID."""
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        self.server.requests.put(Request(self.path, self.headers.get_content_type(),
-                                         self.headers.get("Authorization", ""), body))
-        if not self.server.acknowledge.wait(timeout=10):
-            self.send_error(504, "test did not release acknowledgement")
+        """Read the complete POST, then wait for this request's scripted outcome."""
+        length = int(self.headers["Content-Length"])
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self.close_connection = True
             return
-        response = json.dumps({"MessageId": MESSAGE_ID}).encode()
-        self.send_response(200)
+        request = Request(self.path, self.headers.get_content_type(),
+                          self.headers.get("Authorization", ""), body)
+        self.server.requests.put(request)
+        try:
+            response = request.response.get(timeout=10)
+        except queue.Empty:
+            self.send_error(504, "test did not supply an SES outcome")
+            return
+        if response is None:
+            self.close_connection = True
+            return
+        data = json.dumps(response.body).encode()
+        self.send_response(response.status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
+        self.send_header("Content-Length", str(len(data)))
+        if response.error_code:
+            self.send_header("x-amzn-errortype", response.error_code)
         self.end_headers()
-        self.wfile.write(response)
+        self.wfile.write(data)
 
 
 @contextlib.contextmanager
@@ -81,6 +115,5 @@ def controlled_endpoint() -> Iterator[Endpoint]:
         try:
             yield server
         finally:
-            server.acknowledge.set()
             server.shutdown()
             thread.join()
