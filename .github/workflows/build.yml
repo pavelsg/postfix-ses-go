@@ -43,6 +43,8 @@ jobs:
           fi
       - run: go vet ./...
       - run: go test ./...
+      - name: Verify temporary failure with a real Postfix queue
+        run: bash tests/postfix/test.sh
       - name: Build and smoke-test release archive
         run: bash scripts/package.sh "$VERSION" dist
       - name: Stage archive for release

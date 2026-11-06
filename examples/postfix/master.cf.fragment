@@ -1,0 +1,4 @@
+# The dedicated sespipe account must exist. Use one argv element per macro.
+sespipe   unix  -       n       n       -       -       pipe
+  user=sespipe null_sender= eol=\r\n
+  argv=/usr/local/libexec/postfix-ses-go ${sender} ${recipient} ${queue_id}

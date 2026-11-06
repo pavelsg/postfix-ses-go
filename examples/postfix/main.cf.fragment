@@ -1,0 +1,4 @@
+# Merge these settings into main.cf. Preserve any existing sender lookup tables.
+sender_dependent_default_transport_maps = regexp:/etc/postfix/ses_senders
+sespipe_destination_recipient_limit = 1
+sespipe_time_limit = 30s
